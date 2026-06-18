@@ -2,3 +2,4 @@
 /obj
 /dvr
 /dvr_test
+.env

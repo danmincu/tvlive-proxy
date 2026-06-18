@@ -1,0 +1,12 @@
+{
+  "name": "rdslive-resolver",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Headless resolver: discovers the rotating HLS playlist URL from the public player page and pushes it to rdslive-proxy via /admin/source.",
+  "dependencies": {
+    "playwright": "1.48.0",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  }
+}

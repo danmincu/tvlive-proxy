@@ -2,6 +2,7 @@ bin/
 obj/
 dvr/
 dvr_test/
+.env
 .git/
 .gitignore
 *.user

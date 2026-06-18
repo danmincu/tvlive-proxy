@@ -80,6 +80,9 @@ int liveSegments = Math.Max(3, int.TryParse(Environment.GetEnvironmentVariable("
 int stallSeconds = Math.Max(15, int.TryParse(Environment.GetEnvironmentVariable("PROXY_STALL_SECONDS"), out var st) ? st : 45);
 // Password required to permanently wipe all DVR recordings (POST /dvr/clear).
 string wipePassword = Environment.GetEnvironmentVariable("PROXY_DVR_WIPE_PASSWORD") ?? "bibita";
+// Shared secret for the auto-resolver to update the source URL (POST /admin/source).
+// If unset, the admin endpoints are disabled (404).
+string adminToken = Environment.GetEnvironmentVariable("PROXY_ADMIN_TOKEN") ?? "";
 
 // The currently-selected upstream stream. Mutated when the user submits the
 // form (POST /set), or pre-loaded from the CLI arg / env var below.
@@ -588,6 +591,36 @@ app.MapGet("/dvr/status", () =>
         toUtc = to,
         bytes,
     });
+});
+
+// ---- Admin: source control for the auto-resolver -------------------------
+// Token-gated (header X-Admin-Token). Disabled with 404 unless PROXY_ADMIN_TOKEN
+// is set. The resolver reaches these over the internal docker network.
+app.MapGet("/admin/source", (HttpRequest request) =>
+{
+    if (adminToken.Length == 0 || request.Headers["X-Admin-Token"].ToString() != adminToken)
+        return Results.NotFound();
+    var (url, _) = state.Snapshot();
+    return Results.Json(new { current = url });
+});
+
+app.MapPost("/admin/source", async (HttpRequest request) =>
+{
+    if (adminToken.Length == 0 || request.Headers["X-Admin-Token"].ToString() != adminToken)
+        return Results.NotFound();
+    using var reader = new StreamReader(request.Body);
+    string url = (await reader.ReadToEndAsync()).Trim();
+    if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) || (uri.Scheme != "http" && uri.Scheme != "https"))
+        return Results.BadRequest("Provide an absolute http(s) URL.");
+
+    var (current, _) = state.Snapshot();
+    if (current == url)
+        return Results.Json(new { updated = false, current = url });
+
+    state.Set(url);
+    if (recorderWake.CurrentCount == 0) recorderWake.Release(); // pick up the new URL now
+    log.LogInformation("Source auto-updated by resolver -> {Url}", url);
+    return Results.Json(new { updated = true, current = url });
 });
 
 // Permanently wipe ALL DVR recordings. Body is the confirmation password (text/plain).

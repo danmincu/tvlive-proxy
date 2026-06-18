@@ -40,8 +40,32 @@ services:
       # Safety net: prune oldest recordings if free disk drops below this many GB
       # (independent of the 24h window). 0 disables. Protects against a full disk.
       PROXY_DVR_MIN_FREE_GB: "10"
+      # Shared secret the auto-resolver uses to update the source URL via /admin/source.
+      # MUST be changed from the default — the proxy is reachable publicly on 13443.
+      PROXY_ADMIN_TOKEN: "${PROXY_ADMIN_TOKEN:-change-me-please}"
     volumes:
       - dvr-data:/app/dvr   # recordings persist across container rebuilds
+
+  # Auto-resolver: headless Chromium that discovers the rotating playlist URL from the
+  # public player page and pushes it to the proxy. Talks to the proxy over the internal
+  # network (no public exposure). See resolver/README and ./resolver.
+  resolver:
+    build: ./resolver
+    image: rdslive-resolver
+    container_name: rdslive-resolver
+    depends_on:
+      - rdslive-proxy
+    restart: unless-stopped
+    environment:
+      PROXY_BASE: "http://rdslive-proxy:13001"
+      PROXY_ADMIN_TOKEN: "${PROXY_ADMIN_TOKEN:-change-me-please}"
+      SOURCE_PAGE: "https://rdslive.org/antena-1/"
+      PROXY_ORIGIN: "https://canale-tv.net"
+      PROXY_REFERER: "https://canale-tv.net/"
+      # RESOLVE_POLL_SECONDS: "30"     # how often to check proxy /health
+      # RESOLVE_PERIODIC_HOURS: "4"    # proactive re-resolve interval
+      # RESOLVE_MIN_INTERVAL_SEC: "120"# never resolve more often than this
+      # RESOLVE_PATTERN: "\\.cfd/.*-got\\.htm"  # regex for the playlist request URL
 
 volumes:
   dvr-data:
