@@ -31,6 +31,7 @@ const PERIODIC_HOURS   = +(process.env.RESOLVE_PERIODIC_HOURS   || 4);
 const MIN_INTERVAL_SEC = +(process.env.RESOLVE_MIN_INTERVAL_SEC || 120);
 const NAV_TIMEOUT_MS   = +(process.env.RESOLVE_NAV_TIMEOUT_MS   || 45000);
 const DEBUG_DIR        = process.env.DEBUG_DIR || '/tmp/resolver-debug';
+const SOURCE_HOST = (() => { try { return new URL(SOURCE_PAGE).host; } catch { return ''; } })();
 // What a playlist request looks like — disguised "...-got.htm" OR a real ".m3u8",
 // on any host (the provider rotates the whole domain).
 const CAPTURE_RE = new RegExp(process.env.RESOLVE_PATTERN || '(-got\\.htm|\\.m3u8)');
@@ -90,9 +91,25 @@ async function captureUrl() {
 
     const page = await ctx.newPage();
     await page.route('**/*', (route) => {
-      const t = route.request().resourceType();
-      return (t === 'image' || t === 'font') ? route.abort() : route.continue();
+      const req = route.request();
+      const t = req.resourceType();
+      if (t === 'image' || t === 'font') return route.abort();
+      // Block ad-driven attempts to navigate the MAIN frame off the source site
+      // (popunder/redirect hijacks — e.g. the keto landing page). Sub-frames (the
+      // player iframe, canale-tv, the .cfd stream) are allowed through.
+      if (req.isNavigationRequest() && req.frame() === page.mainFrame()) {
+        let h = '';
+        try { h = new URL(req.url()).host; } catch {}
+        if (h && SOURCE_HOST && h !== SOURCE_HOST) {
+          log('blocked main-frame redirect ->', h);
+          return route.abort();
+        }
+      }
+      return route.continue();
     });
+    // Auto-dismiss any popup windows ads open (they don't hijack the main page,
+    // but close them to keep things clean).
+    ctx.on('page', (p) => { if (p !== page) p.close().catch(() => {}); });
 
     await page.goto(SOURCE_PAGE, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS }).catch(() => {});
 
