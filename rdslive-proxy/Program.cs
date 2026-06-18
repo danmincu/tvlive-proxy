@@ -74,8 +74,14 @@ builder.Services.AddSingleton(_ => new HttpClient(new HttpClientHandler
     AllowAutoRedirect = true,
 }));
 
+// The Chromecast default receiver fetches the manifest/segments via XHR and
+// requires CORS headers (a same-origin browser does not). Allow everything.
+builder.Services.AddCors();
+
 var app = builder.Build();
 var log = app.Logger;
+
+app.UseCors(p => p.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod());
 
 // Build a throwaway self-signed cert for the https endpoint. Export+reimport as
 // PFX so Kestrel reliably gets the private key (notably on Windows).
@@ -180,8 +186,17 @@ app.MapGet("/{*path}", async (string path, HttpResponse response, HttpClient htt
     using var upstream = await http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
     response.StatusCode = (int)upstream.StatusCode;
 
-    if (upstream.Content.Headers.ContentType is { } contentType)
-        response.ContentType = contentType.ToString();
+    // The origin serves MPEG-TS segments disguised as .html with Content-Type
+    // text/html. hls.js ignores that and parses the bytes, but the Chromecast
+    // receiver won't demux a text/html response — so correct it to video/mp2t.
+    // (Sub-playlists, if any, keep the HLS type.)
+    string? upstreamType = upstream.Content.Headers.ContentType?.ToString();
+    if (path.EndsWith(".m3u8", StringComparison.OrdinalIgnoreCase))
+        response.ContentType = "application/vnd.apple.mpegurl";
+    else if (string.IsNullOrEmpty(upstreamType) || upstreamType.StartsWith("text/html", StringComparison.OrdinalIgnoreCase))
+        response.ContentType = "video/mp2t";
+    else
+        response.ContentType = upstreamType;
     response.Headers.CacheControl = "no-cache, no-store";
 
     if (!upstream.IsSuccessStatusCode)
@@ -287,6 +302,9 @@ static string IndexPage(string? current, int httpPort) => $$"""
       var url = castBase + '/stream.m3u8?t=' + Date.now();
       var info = new chrome.cast.media.MediaInfo(url, 'application/x-mpegurl');
       info.streamType = chrome.cast.media.StreamType.LIVE;
+      // The segments are MPEG-TS; tell the receiver so it doesn't have to guess.
+      if (chrome.cast.media.HlsSegmentFormat) info.hlsSegmentFormat = chrome.cast.media.HlsSegmentFormat.TS;
+      if (chrome.cast.media.HlsVideoSegmentFormat) info.hlsVideoSegmentFormat = chrome.cast.media.HlsVideoSegmentFormat.MPEG2_TS;
       session.loadMedia(new chrome.cast.media.LoadRequest(info)).then(
         function () { setStatus('Casting to ' + session.getCastDevice().friendlyName); },
         function (err) { setStatus('Cast failed: ' + JSON.stringify(err)); }

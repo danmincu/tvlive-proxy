@@ -1,0 +1,16 @@
+info: rdslive-proxy[0] rdslive-proxy listening (bind 127.0.0.1)
+info: rdslive-proxy[0] Player (http):  http://localhost:13001/
+info: rdslive-proxy[0] Player (https): https://localhost:13443/   <- open via LAN IP for Chromecast
+info: rdslive-proxy[0] VLC / m3u8:     http://localhost:13001/stream.m3u8
+info: rdslive-proxy[0] Pre-loaded:     https://alpha1.yosefina1.cfd/ah1/usergenx304Jtlrnd2-got.htm
+info: Microsoft.Hosting.Lifetime[14] Now listening on: http://127.0.0.1:13001
+info: Microsoft.Hosting.Lifetime[14] Now listening on: https://127.0.0.1:13443
+info: Microsoft.Hosting.Lifetime[0] Application started. Press Ctrl+C to shut down.
+info: Microsoft.Hosting.Lifetime[0] Hosting environment: Production
+info: Microsoft.Hosting.Lifetime[0] Content root path: C:\Github\tvlive-proxy\rdslive-proxy
+info: Microsoft.AspNetCore.Hosting.Diagnostics[1] Request starting HTTP/1.1 GET http://127.0.0.1:13001/stream.m3u8 - - -
+info: Microsoft.AspNetCore.Cors.Infrastructure.CorsService[4] CORS policy execution successful.
+info: Microsoft.AspNetCore.Routing.EndpointMiddleware[0] Executing endpoint 'HTTP: GET /stream.m3u8'
+info: rdslive-proxy[0] Playlist  -> https://alpha1.yosefina1.cfd/ah1/usergenx304Jtlrnd2-got.htm
+info: Microsoft.AspNetCore.Routing.EndpointMiddleware[1] Executed endpoint 'HTTP: GET /stream.m3u8'
+info: Microsoft.AspNetCore.Hosting.Diagnostics[2] Request finished HTTP/1.1 GET http://127.0.0.1:13001/stream.m3u8 - 200 - application/vnd.apple.mpegurl 171.0127ms
