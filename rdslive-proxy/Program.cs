@@ -69,6 +69,11 @@ TimeSpan dvrPoll = TimeSpan.FromSeconds(
 // Set to 0 to disable.
 double dvrMinFreeGb = double.TryParse(Environment.GetEnvironmentVariable("PROXY_DVR_MIN_FREE_GB"), NumberStyles.Float, CultureInfo.InvariantCulture, out var mf) ? mf : 10;
 long dvrMinFreeBytes = (long)(dvrMinFreeGb * 1024 * 1024 * 1024);
+// Live fan-out: when DVR is on, /stream.m3u8 serves the newest N recorded segments
+// (the "live edge") from the local buffer, so every viewer is served locally and the
+// provider only ever sees the single recorder ingest. Bigger = more delay but safer
+// against stalls. Minimum 3.
+int liveSegments = Math.Max(3, int.TryParse(Environment.GetEnvironmentVariable("PROXY_LIVE_SEGMENTS"), out var ls) ? ls : 8);
 
 // The currently-selected upstream stream. Mutated when the user submits the
 // form (POST /set), or pre-loaded from the CLI arg / env var below.
@@ -226,6 +231,28 @@ async Task<HttpResponseMessage?> SendUpstreamAsync(HttpClient http, string url, 
 static bool LooksLikeHlsPlaylist(string body) =>
     body.TrimStart('﻿', ' ', '\t', '\r', '\n').StartsWith("#EXTM3U", StringComparison.Ordinal);
 
+// Build an HLS media playlist from recorded segments, pointing at the local
+// /dvr/seg/<id>.ts files. endlist=false => live (player tracks the edge); true =>
+// closed VOD (fully seekable, no refresh).
+static string BuildDvrPlaylist(DvrSeg[] segs, bool endlist)
+{
+    var sb = new StringBuilder();
+    sb.Append("#EXTM3U\n#EXT-X-VERSION:6\n");
+    double maxDur = 6;
+    foreach (var s in segs) if (s.Dur > maxDur) maxDur = s.Dur;
+    sb.Append("#EXT-X-TARGETDURATION:").Append((int)Math.Ceiling(maxDur)).Append('\n');
+    sb.Append("#EXT-X-MEDIA-SEQUENCE:").Append(segs.Length > 0 ? segs[0].Id : 0).Append('\n');
+    if (endlist) sb.Append("#EXT-X-PLAYLIST-TYPE:VOD\n");
+    foreach (var s in segs)
+    {
+        if (s.Disc) sb.Append("#EXT-X-DISCONTINUITY\n");
+        sb.Append("#EXTINF:").Append(s.Dur.ToString("0.000", CultureInfo.InvariantCulture)).Append(",\n");
+        sb.Append("/dvr/seg/").Append(s.Id.ToString("D12")).Append(".ts\n");
+    }
+    if (endlist) sb.Append("#EXT-X-ENDLIST\n");
+    return sb.ToString();
+}
+
 // Download one segment's bytes (with retries). Returns null on failure. Bounded
 // timeout so a stuck segment can't block the recorder loop for long.
 async Task<byte[]?> DownloadSegmentAsync(HttpClient http, string url, CancellationToken ct)
@@ -243,6 +270,7 @@ async Task IngestLoopAsync(CancellationToken ct)
     string? channel = null;     // current upstream playlist URL we're recording
     long lastSeq = -1;          // last upstream media-sequence number stored
     bool pendingDisc = false;   // mark the next stored segment as a discontinuity
+    long session = dvr.MaxSession(); // bumped on each channel change (resumes above disk)
     var lastPrune = DateTime.UtcNow;
 
     log.LogInformation("DVR: recording enabled, dir='{Dir}', retention={Hours}h, poll={Poll}s",
@@ -258,6 +286,7 @@ async Task IngestLoopAsync(CancellationToken ct)
                 channel = playlistUrl;
                 lastSeq = -1;
                 pendingDisc = true; // channel switch -> discontinuity in the recording
+                session++;          // new channel -> new session (live edge shows only this)
                 if (channel is not null) log.LogInformation("DVR: now recording {Url}", channel);
             }
             if (playlistUrl is null || baseUrl is null)
@@ -338,7 +367,7 @@ async Task IngestLoopAsync(CancellationToken ct)
                         long id = dvr.Reserve();
                         await File.WriteAllBytesAsync(dvr.PathFor(id), bytes, ct);
                         dvr.Add(new DvrSeg(id, pendingDur > 0 ? pendingDur : 6.0, DateTime.UtcNow,
-                            pendingDisc || extDisc || gap, bytes.LongLength));
+                            pendingDisc || extDisc || gap, bytes.LongLength, session));
                         health.Segment();
 
                         lastSeq = seq;
@@ -399,7 +428,14 @@ app.MapPost("/set", async (HttpRequest request) =>
     return Results.NoContent();
 });
 
-// Call 1: the playlist, served to the player / VLC.
+// Call 1: the "live" playlist, served to the player / VLC.
+//
+// Fan-out control: when DVR is recording, we serve EVERY live viewer from the local
+// buffer at the live edge (newest segments of the current channel) instead of
+// proxying the upstream playlist + segments per client. The provider therefore only
+// ever sees the single recorder ingest, regardless of how many people are watching.
+// Viewers sit a little behind true-live (recorder lag + player buffer). Cold start or
+// DVR disabled falls back to the verbatim upstream passthrough below.
 app.MapGet("/stream.m3u8", async (HttpResponse response, HttpClient http, CancellationToken ct) =>
 {
     var (playlistUrl, _) = state.Snapshot();
@@ -410,7 +446,21 @@ app.MapGet("/stream.m3u8", async (HttpResponse response, HttpClient http, Cancel
         return;
     }
 
-    log.LogInformation("Playlist  -> {Url}", playlistUrl);
+    if (dvrEnabled)
+    {
+        var live = dvr.LiveWindow(liveSegments);
+        if (live.Length > 0)
+        {
+            response.ContentType = "application/vnd.apple.mpegurl";
+            response.Headers.CacheControl = "no-cache, no-store";
+            await response.WriteAsync(BuildDvrPlaylist(live, endlist: false), ct);
+            return;
+        }
+        // Buffer empty (cold start / just switched) — fall through to passthrough
+        // just for this brief gap until the recorder has stored a segment.
+    }
+
+    log.LogInformation("Playlist (passthrough) -> {Url}", playlistUrl);
 
     using var upstream = await SendUpstreamAsync(http, playlistUrl, "Playlist", ct);
     if (upstream is null)
@@ -463,24 +513,9 @@ app.MapGet("/dvr.m3u8", (HttpResponse response, HttpRequest request) =>
     }
     bool vod = request.Query["vod"] == "1";
 
-    var sb = new StringBuilder();
-    sb.Append("#EXTM3U\n#EXT-X-VERSION:6\n");
-    double maxDur = 6;
-    foreach (var s in segs) if (s.Dur > maxDur) maxDur = s.Dur;
-    sb.Append("#EXT-X-TARGETDURATION:").Append((int)Math.Ceiling(maxDur)).Append('\n');
-    sb.Append("#EXT-X-MEDIA-SEQUENCE:").Append(segs.Length > 0 ? segs[0].Id : 0).Append('\n');
-    if (vod) sb.Append("#EXT-X-PLAYLIST-TYPE:VOD\n");
-    foreach (var s in segs)
-    {
-        if (s.Disc) sb.Append("#EXT-X-DISCONTINUITY\n");
-        sb.Append("#EXTINF:").Append(s.Dur.ToString("0.000", CultureInfo.InvariantCulture)).Append(",\n");
-        sb.Append("/dvr/seg/").Append(s.Id.ToString("D12")).Append(".ts\n");
-    }
-    if (vod) sb.Append("#EXT-X-ENDLIST\n");
-
     response.ContentType = "application/vnd.apple.mpegurl";
     response.Headers.CacheControl = "no-cache, no-store";
-    return response.WriteAsync(sb.ToString());
+    return response.WriteAsync(BuildDvrPlaylist(segs, endlist: vod));
 });
 
 // Serve a recorded segment from disk.
@@ -889,9 +924,10 @@ sealed class StreamHealth
 
 
 // One recorded segment in the DVR index. Id is our own monotonic counter (the
-// upstream media-sequence resets across channels, so we don't reuse it). The
-// segment file on disk is "<Id:D12>.ts".
-sealed record DvrSeg(long Id, double Dur, DateTime Utc, bool Disc, long Size);
+// upstream media-sequence resets across channels, so we don't reuse it). Session
+// increments on each channel change, so the live-edge view can show only the
+// current channel. The segment file on disk is "<Id:D12>.ts".
+sealed record DvrSeg(long Id, double Dur, DateTime Utc, bool Disc, long Size, long Session);
 
 // The rolling DVR buffer: segment files under <dir>/seg + an append-only index
 // file <dir>/index.log. The in-memory list is the source of truth at runtime;
@@ -932,6 +968,33 @@ sealed class DvrStore
     }
 
     public DvrSeg[] Snapshot() { lock (_gate) return _segs.ToArray(); }
+
+    // The newest up-to-maxSegments segments that belong to the current channel
+    // (latest session) — the "live edge" served to all viewers.
+    public DvrSeg[] LiveWindow(int maxSegments)
+    {
+        lock (_gate)
+        {
+            int n = _segs.Count;
+            if (n == 0) return Array.Empty<DvrSeg>();
+            long sess = _segs[n - 1].Session;
+            int start = n, count = 0;
+            for (int i = n - 1; i >= 0 && count < maxSegments; i--)
+            {
+                if (_segs[i].Session != sess) break;
+                start = i; count++;
+            }
+            var res = new DvrSeg[n - start];
+            _segs.CopyTo(start, res, 0, n - start);
+            return res;
+        }
+    }
+
+    // Highest session id on disk, so a restart resumes with strictly newer sessions.
+    public long MaxSession()
+    {
+        lock (_gate) { long m = 0; foreach (var s in _segs) if (s.Session > m) m = s.Session; return m; }
+    }
 
     public (int count, double seconds, DateTime? from, DateTime? to, long bytes) Stats()
     {
@@ -1062,7 +1125,8 @@ sealed class DvrStore
             s.Dur.ToString(CultureInfo.InvariantCulture),
             new DateTimeOffset(s.Utc, TimeSpan.Zero).ToUnixTimeMilliseconds(),
             s.Disc ? 1 : 0,
-            s.Size);
+            s.Size,
+            s.Session);
 
     static DvrSeg? Deserialize(string line)
     {
@@ -1072,6 +1136,8 @@ sealed class DvrStore
         if (!double.TryParse(p[1], NumberStyles.Float, CultureInfo.InvariantCulture, out var dur)) return null;
         if (!long.TryParse(p[2], out var ms)) return null;
         long.TryParse(p[4], out var size);
-        return new DvrSeg(id, dur, DateTimeOffset.FromUnixTimeMilliseconds(ms).UtcDateTime, p[3] == "1", size);
+        long session = 0;
+        if (p.Length > 5) long.TryParse(p[5], out session); // older index files lack this
+        return new DvrSeg(id, dur, DateTimeOffset.FromUnixTimeMilliseconds(ms).UtcDateTime, p[3] == "1", size, session);
     }
 }

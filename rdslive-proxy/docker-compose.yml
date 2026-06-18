@@ -26,6 +26,10 @@ services:
       PROXY_DVR_ENABLED: "true"
       PROXY_DVR_HOURS: "24"
       # PROXY_DVR_POLL_SECONDS: "4"
+      # Live fan-out: with DVR on, ALL viewers are served from the local buffer at the
+      # live edge, so the provider only sees the single recorder ingest no matter how
+      # many people watch. Bigger window = a bit more delay but more resilient to stalls.
+      # PROXY_LIVE_SEGMENTS: "8"
       # Safety net: prune oldest recordings if free disk drops below this many GB
       # (independent of the 24h window). 0 disables. Protects against a full disk.
       PROXY_DVR_MIN_FREE_GB: "10"
