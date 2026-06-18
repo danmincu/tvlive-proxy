@@ -74,6 +74,12 @@ long dvrMinFreeBytes = (long)(dvrMinFreeGb * 1024 * 1024 * 1024);
 // provider only ever sees the single recorder ingest. Bigger = more delay but safer
 // against stalls. Minimum 3.
 int liveSegments = Math.Max(3, int.TryParse(Environment.GetEnvironmentVariable("PROXY_LIVE_SEGMENTS"), out var ls) ? ls : 8);
+// If no new segment has been recorded for this long while a stream is set, the live
+// edge is "stalled" — the source may return a valid-but-frozen playlist (e.g. an
+// expired token), which otherwise looks healthy. We surface this so the UI can warn.
+int stallSeconds = Math.Max(15, int.TryParse(Environment.GetEnvironmentVariable("PROXY_STALL_SECONDS"), out var st) ? st : 45);
+// Password required to permanently wipe all DVR recordings (POST /dvr/clear).
+string wipePassword = Environment.GetEnvironmentVariable("PROXY_DVR_WIPE_PASSWORD") ?? "bibita";
 
 // The currently-selected upstream stream. Mutated when the user submits the
 // form (POST /set), or pre-loaded from the CLI arg / env var below.
@@ -113,10 +119,14 @@ builder.WebHost.ConfigureKestrel(options =>
 });
 
 // One shared HttpClient. Automatic decompression so we hand the player plain bytes.
-builder.Services.AddSingleton(_ => new HttpClient(new HttpClientHandler
+builder.Services.AddSingleton(_ => new HttpClient(new SocketsHttpHandler
 {
     AutomaticDecompression = DecompressionMethods.All,
     AllowAutoRedirect = true,
+    // Recycle pooled connections every couple of minutes so the recorder doesn't pin
+    // a stale Cloudflare edge over long runtimes (a cause of multi-hour freezes); also
+    // lets DNS changes (the provider rotates edges) take effect.
+    PooledConnectionLifetime = TimeSpan.FromMinutes(2),
 })
 {
     // We manage timeouts per-attempt via a CancellationToken (see SendUpstreamAsync),
@@ -580,15 +590,39 @@ app.MapGet("/dvr/status", () =>
     });
 });
 
+// Permanently wipe ALL DVR recordings. Body is the confirmation password (text/plain).
+app.MapPost("/dvr/clear", async (HttpRequest request) =>
+{
+    using var reader = new StreamReader(request.Body);
+    string pw = (await reader.ReadToEndAsync()).Trim();
+    if (pw != wipePassword)
+        return Results.StatusCode(StatusCodes.Status403Forbidden);
+
+    int removed = dvr.Clear();
+    log.LogWarning("DVR: ALL recordings wiped via /dvr/clear ({N} segments)", removed);
+    return Results.Json(new { cleared = removed });
+});
+
 // Upstream health, for the UI to show a friendly banner when the source is down.
 app.MapGet("/health", () =>
 {
     var h = health.Snapshot();
+    // "Stalled" = the recorder is fetching a playlist that looks valid but isn't
+    // producing new segments (e.g. an expired provider token returning a frozen
+    // playlist). h.Ok alone would miss this, so the live edge would silently freeze.
+    bool stalled = dvrEnabled
+        && h.LastSegmentUtc is { } seg
+        && (DateTime.UtcNow - seg) > TimeSpan.FromSeconds(stallSeconds);
+    bool ok = h.Ok && !stalled;
+    string? error = stalled
+        ? "no new video from the source for a while - the stream or your link may have stopped"
+        : h.Error;
     return Results.Json(new
     {
-        ok = h.Ok,
+        ok,
+        stalled,
         hasStream = state.PlaylistUrl is not null,
-        error = h.Error,
+        error,
         failures = h.Failures,
         lastOkUtc = h.LastOkUtc,
         lastSegmentUtc = h.LastSegmentUtc,
@@ -688,6 +722,7 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
   input { flex:1 1 auto; min-width:0; padding:10px; border:1px solid #444; border-radius:6px; background:#222; color:#eee; font-size:16px; }
   button, a.dl { padding:10px 14px; border:0; border-radius:6px; background:#2d7; color:#000; font-weight:600; font-size:14px; line-height:1; cursor:pointer; white-space:nowrap; text-align:center; display:inline-flex; align-items:center; justify-content:center; }
   button.alt, a.dl { background:#345; color:#eee; }
+  button.danger { background:#a33; color:#fff; }
   a.dl { text-decoration:none; }
   button.active { outline:2px solid #2d7; outline-offset:-2px; }
   google-cast-launcher { width:38px; height:38px; flex:0 0 auto; cursor:pointer; --connected-color:#2d7; --disconnected-color:#eee; }
@@ -716,6 +751,7 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
       <button id="btnLive" class="alt" onclick="goLive()" title="Live edge">Live</button>
       <button id="btnDvr" class="alt" onclick="goDvr()" title="Timeshift / DVR — scrub back through the recorded window">DVR</button>
       <a class="dl" href="/dvr/export.ts" title="Download the recorded buffer as one .ts file">&#8595; .ts</a>
+      <button class="danger" onclick="wipeDvr()" title="Permanently delete ALL recordings">Wipe</button>
       <google-cast-launcher id="castbtn" title="Cast to a Chromecast (open this page via your LAN IP, not localhost)"></google-cast-launcher>
     </div>
   </header>
@@ -833,6 +869,34 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
         .catch(function (e) { setStatus('Failed: ' + e.message); });
     }
 
+    // Permanently delete all DVR recordings — strong warning + password.
+    function wipeDvr() {
+      if (!confirm('⚠ WARNING\n\nThis permanently DELETES ALL recorded DVR data.\nThis cannot be undone.\n\nContinue?')) return;
+      var pw = prompt('Type the confirmation password to permanently delete ALL recordings:');
+      if (pw === null || pw === '') return;
+      fetch('/dvr/clear', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: pw })
+        .then(function (r) {
+          if (r.status === 403) { alert('Wrong password — nothing was deleted.'); return; }
+          if (!r.ok) { alert('Failed to delete (HTTP ' + r.status + ').'); return; }
+          return r.json().then(function (j) { alert('Deleted all DVR recordings (' + (j.cleared || 0) + ' segments).'); refreshDvr(); });
+        })
+        .catch(function (e) { alert('Failed: ' + e.message); });
+    }
+
+    // Stall watchdog: if playback stops advancing while we believe we're playing,
+    // reload the current source to recover (e.g. a wedged hls.js after a freeze).
+    var wdLastTime = 0, wdStalledSince = 0;
+    setInterval(function () {
+      if (v.paused || v.seeking || v.readyState < 2) { wdLastTime = v.currentTime; wdStalledSince = 0; return; }
+      if (v.currentTime > wdLastTime + 0.25) { wdLastTime = v.currentTime; wdStalledSince = 0; return; }
+      if (wdStalledSince === 0) { wdStalledSince = Date.now(); return; }
+      if (Date.now() - wdStalledSince > 15000) {
+        wdStalledSince = 0; wdLastTime = 0;
+        setStatus('Stalled — reloading…');
+        play(currentPath);
+      }
+    }, 5000);
+
     // Show how much is recorded, next to the DVR button.
     function refreshDvr() {
       fetch('/dvr/status').then(function (r) { return r.json(); }).then(function (s) {
@@ -842,19 +906,24 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
       }).catch(function () {});
     }
 
-    // Show a friendly banner when the upstream source is unavailable / changed.
+    // Show a friendly banner when the upstream source is unavailable / stalled, and
+    // auto-resume playback when it recovers.
+    var lastHealthOk = true;
     function refreshHealth() {
       fetch('/health').then(function (r) { return r.json(); }).then(function (h) {
         var b = document.getElementById('banner');
         if (!h.hasStream) {
           b.className = ''; b.textContent = '';
         } else if (h.ok === false) {
-          b.textContent = '⚠ Source unavailable' + (h.error ? ' — ' + h.error : '') +
-            '. The provider link may have changed; paste a working URL above and press OK. (Recording is paused; the DVR buffer is kept.)';
+          b.textContent = '⚠ ' + (h.error || 'Source unavailable') +
+            '. Paste a fresh URL above and press OK. Recording is paused, but your recording is intact — press DVR to watch it.';
           b.className = 'show';
         } else {
           b.className = ''; b.textContent = '';
+          // Recovered after being down — reload the current source to catch the live edge.
+          if (!lastHealthOk) play(currentPath);
         }
+        lastHealthOk = (h.ok !== false);
       }).catch(function () {});
     }
 
@@ -994,6 +1063,26 @@ sealed class DvrStore
     public long MaxSession()
     {
         lock (_gate) { long m = 0; foreach (var s in _segs) if (s.Session > m) m = s.Session; return m; }
+    }
+
+    // Permanently delete ALL recordings: clear the index and remove every segment
+    // file. Returns how many segments were dropped. The recorder simply starts
+    // refilling an empty buffer afterwards.
+    public int Clear()
+    {
+        int n;
+        lock (_gate)
+        {
+            n = _segs.Count;
+            _segs.Clear();
+            _nextId = 1;
+            try { if (Directory.Exists(_segDir)) Directory.Delete(_segDir, recursive: true); }
+            catch (IOException) { /* a file may be mid-write; orphans get overwritten by id reuse */ }
+            catch (UnauthorizedAccessException) { }
+            Directory.CreateDirectory(_segDir);
+            try { if (File.Exists(_indexPath)) File.Delete(_indexPath); } catch (IOException) { }
+        }
+        return n;
     }
 
     public (int count, double seconds, DateTime? from, DateTime? to, long bytes) Stats()

@@ -30,6 +30,13 @@ services:
       # live edge, so the provider only sees the single recorder ingest no matter how
       # many people watch. Bigger window = a bit more delay but more resilient to stalls.
       # PROXY_LIVE_SEGMENTS: "8"
+      # If no new segment is recorded for this many seconds while a stream is set, the
+      # live edge is treated as "stalled" (e.g. the provider token expired and it now
+      # returns a frozen playlist) so the UI warns instead of silently freezing.
+      # PROXY_STALL_SECONDS: "45"
+      # Password required to permanently wipe ALL recordings via the UI "Wipe" button
+      # (POST /dvr/clear). Change this from the default if the player is reachable publicly.
+      PROXY_DVR_WIPE_PASSWORD: "bibita"
       # Safety net: prune oldest recordings if free disk drops below this many GB
       # (independent of the 24h window). 0 disables. Protects against a full disk.
       PROXY_DVR_MIN_FREE_GB: "10"
