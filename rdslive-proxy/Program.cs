@@ -79,6 +79,14 @@ string initialUrl =
     ?? "https://alpha1.yosefina1.cfd/ah1/usergenx304Jtlrnd2-got.htm";
 state.Set(initialUrl);
 
+// Tracks whether the upstream is currently serving a valid stream, so we can warn
+// the user (and stop recording junk) if the provider changes/kills the URL.
+var health = new StreamHealth();
+
+// Lets POST /set interrupt the recorder's backoff sleep so a freshly-pasted URL is
+// picked up immediately instead of after the (possibly long) backoff delay.
+var recorderWake = new SemaphoreSlim(0, 1);
+
 // Bind address: 0.0.0.0 so it's reachable on the LAN (required for casting and
 // for the container). Override with PROXY_BIND (e.g. "127.0.0.1").
 string bind = Environment.GetEnvironmentVariable("PROXY_BIND") ?? "0.0.0.0";
@@ -164,25 +172,32 @@ void AddBrowserHeaders(HttpRequestMessage req)
 // statuses like 403/404. Retries always happen before we stream any bytes to the
 // client, so they're safe. Returns the response (which may carry an error status)
 // or null if every attempt failed to get a response at all.
-async Task<HttpResponseMessage?> SendUpstreamAsync(HttpClient http, string url, string label, CancellationToken ct)
+// perAttemptTimeout/attempts override the global defaults — the recorder uses short,
+// few attempts so a dead URL fails fast (it re-polls anyway); on-demand client
+// requests use the longer defaults.
+async Task<HttpResponseMessage?> SendUpstreamAsync(HttpClient http, string url, string label, CancellationToken ct,
+    TimeSpan? perAttemptTimeout = null, int? attempts = null)
 {
     static bool IsTransient(HttpStatusCode s) =>
         (int)s >= 500 || s == HttpStatusCode.RequestTimeout || s == HttpStatusCode.TooManyRequests;
 
+    var timeout = perAttemptTimeout ?? upstreamTimeout;
+    int max = attempts ?? maxAttempts;
+
     for (int attempt = 1; ; attempt++)
     {
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeoutCts.CancelAfter(upstreamTimeout);
+        timeoutCts.CancelAfter(timeout);
         var req = new HttpRequestMessage(HttpMethod.Get, url);
         AddBrowserHeaders(req);
 
         try
         {
             var resp = await http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, timeoutCts.Token);
-            if (!IsTransient(resp.StatusCode) || attempt >= maxAttempts)
+            if (!IsTransient(resp.StatusCode) || attempt >= max)
                 return resp;
             log.LogWarning("{Label}: upstream {Status} (attempt {Attempt}/{Max}); retrying",
-                label, (int)resp.StatusCode, attempt, maxAttempts);
+                label, (int)resp.StatusCode, attempt, max);
             resp.Dispose();
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -192,12 +207,12 @@ async Task<HttpResponseMessage?> SendUpstreamAsync(HttpClient http, string url, 
         catch (Exception ex) when (ex is HttpRequestException or OperationCanceledException or IOException)
         {
             // our per-attempt timeout, or a connection-level error
-            if (attempt >= maxAttempts)
+            if (attempt >= max)
             {
-                log.LogWarning("{Label}: failed after {Max} attempts ({Msg})", label, maxAttempts, ex.Message);
+                log.LogWarning("{Label}: failed after {Max} attempts ({Msg})", label, max, ex.Message);
                 return null;
             }
-            log.LogWarning("{Label}: {Msg} (attempt {Attempt}/{Max}); retrying", label, ex.Message, attempt, maxAttempts);
+            log.LogWarning("{Label}: {Msg} (attempt {Attempt}/{Max}); retrying", label, ex.Message, attempt, max);
         }
 
         // Exponential backoff: 200ms, 400ms, 800ms, ...
@@ -205,10 +220,17 @@ async Task<HttpResponseMessage?> SendUpstreamAsync(HttpClient http, string url, 
     }
 }
 
-// Download one segment's bytes (with retries). Returns null on failure.
+// A real HLS playlist begins with the #EXTM3U tag (after any BOM/whitespace).
+// Anything else served at the playlist URL (e.g. an HTML landing/error page) means
+// the source is broken — don't parse it as segments.
+static bool LooksLikeHlsPlaylist(string body) =>
+    body.TrimStart('﻿', ' ', '\t', '\r', '\n').StartsWith("#EXTM3U", StringComparison.Ordinal);
+
+// Download one segment's bytes (with retries). Returns null on failure. Bounded
+// timeout so a stuck segment can't block the recorder loop for long.
 async Task<byte[]?> DownloadSegmentAsync(HttpClient http, string url, CancellationToken ct)
 {
-    using var resp = await SendUpstreamAsync(http, url, "DVR segment", ct);
+    using var resp = await SendUpstreamAsync(http, url, "DVR segment", ct, TimeSpan.FromSeconds(10), 2);
     if (resp is null || !resp.IsSuccessStatusCode) return null;
     return await resp.Content.ReadAsByteArrayAsync(ct);
 }
@@ -244,61 +266,84 @@ async Task IngestLoopAsync(CancellationToken ct)
                 continue;
             }
 
-            using var resp = await SendUpstreamAsync(http, playlistUrl, "DVR playlist", ct);
-            if (resp is not null && resp.IsSuccessStatusCode)
+            // Short timeout / few attempts so a dead URL fails fast and the loop stays
+            // responsive to channel changes (the loop re-polls regardless).
+            using (var resp = await SendUpstreamAsync(http, playlistUrl, "DVR playlist", ct, TimeSpan.FromSeconds(6), 2))
             {
-                var text = await resp.Content.ReadAsStringAsync(ct);
-                long mediaSeq = 0;
-                double pendingDur = 0;
-                bool extDisc = false;
-                int idx = 0;
+                string? text = resp is not null && resp.IsSuccessStatusCode
+                    ? await resp.Content.ReadAsStringAsync(ct)
+                    : null;
 
-                foreach (var raw in text.Split('\n'))
+                if (text is null)
                 {
-                    var line = raw.Trim();
-                    if (line.Length == 0) continue;
-                    if (line.StartsWith("#EXT-X-MEDIA-SEQUENCE:"))
-                    {
-                        long.TryParse(line.AsSpan(22).Trim(), out mediaSeq);
-                        continue;
-                    }
-                    if (line.StartsWith("#EXT-X-DISCONTINUITY-SEQUENCE")) continue;
-                    if (line == "#EXT-X-DISCONTINUITY") { extDisc = true; continue; }
-                    if (line.StartsWith("#EXTINF:"))
-                    {
-                        var v = line.AsSpan(8);
-                        int comma = v.IndexOf(',');
-                        if (comma >= 0) v = v[..comma];
-                        double.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out pendingDur);
-                        continue;
-                    }
-                    if (line.StartsWith('#')) continue;
+                    health.Fail(resp is null ? "upstream unreachable" : $"upstream returned HTTP {(int)resp.StatusCode}");
+                }
+                else if (!LooksLikeHlsPlaylist(text))
+                {
+                    // 200 OK but not an HLS playlist — the provider likely repurposed
+                    // the URL (landing/error page). Do NOT parse it as segments.
+                    health.Fail("not a valid HLS playlist (the source URL may have changed)");
+                }
+                else
+                {
+                    health.Ok();
+                    long mediaSeq = 0;
+                    double pendingDur = 0;
+                    bool extDisc = false;
+                    int idx = 0;
 
-                    // A segment URI.
-                    long seq = mediaSeq + idx;
-                    idx++;
-                    if (seq <= lastSeq) { extDisc = false; pendingDur = 0; continue; }
-
-                    bool gap = lastSeq >= 0 && seq > lastSeq + 1; // we missed some -> discontinuity
-                    string segUrl = Uri.TryCreate(line, UriKind.Absolute, out var abs) ? abs.ToString() : baseUrl + line;
-
-                    var bytes = await DownloadSegmentAsync(http, segUrl, ct);
-                    if (bytes is null)
+                    foreach (var raw in text.Split('\n'))
                     {
-                        // Couldn't fetch it; skip but don't stall, and flag a hole.
+                        var line = raw.Trim();
+                        if (line.Length == 0) continue;
+                        if (line.StartsWith("#EXT-X-MEDIA-SEQUENCE:"))
+                        {
+                            long.TryParse(line.AsSpan(22).Trim(), out mediaSeq);
+                            continue;
+                        }
+                        if (line.StartsWith("#EXT-X-DISCONTINUITY-SEQUENCE")) continue;
+                        if (line == "#EXT-X-DISCONTINUITY") { extDisc = true; continue; }
+                        if (line.StartsWith("#EXTINF:"))
+                        {
+                            var v = line.AsSpan(8);
+                            int comma = v.IndexOf(',');
+                            if (comma >= 0) v = v[..comma];
+                            double.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out pendingDur);
+                            continue;
+                        }
+                        if (line.StartsWith('#')) continue;
+
+                        // A segment URI.
+                        long seq = mediaSeq + idx;
+                        idx++;
+                        if (seq <= lastSeq) { extDisc = false; pendingDur = 0; continue; }
+
+                        bool gap = lastSeq >= 0 && seq > lastSeq + 1; // we missed some -> discontinuity
+                        string segUrl = Uri.TryCreate(line, UriKind.Absolute, out var abs) ? abs.ToString() : baseUrl + line;
+
+                        var bytes = await DownloadSegmentAsync(http, segUrl, ct);
+                        // Only store real MPEG-TS (starts with the 0x47 sync byte). A
+                        // token-expired/replaced URL often returns a 200 HTML error page;
+                        // don't record that as video. Treat as a hole + discontinuity.
+                        if (bytes is null || bytes.Length == 0 || bytes[0] != 0x47)
+                        {
+                            if (bytes is { Length: > 0 })
+                                log.LogWarning("DVR: segment not MPEG-TS, skipping: {Url}", segUrl);
+                            lastSeq = seq;
+                            pendingDisc = true;
+                            extDisc = false; pendingDur = 0;
+                            continue;
+                        }
+
+                        long id = dvr.Reserve();
+                        await File.WriteAllBytesAsync(dvr.PathFor(id), bytes, ct);
+                        dvr.Add(new DvrSeg(id, pendingDur > 0 ? pendingDur : 6.0, DateTime.UtcNow,
+                            pendingDisc || extDisc || gap, bytes.LongLength));
+                        health.Segment();
+
                         lastSeq = seq;
-                        pendingDisc = true;
-                        extDisc = false; pendingDur = 0;
-                        continue;
+                        pendingDisc = false; extDisc = false; pendingDur = 0;
                     }
-
-                    long id = dvr.Reserve();
-                    await File.WriteAllBytesAsync(dvr.PathFor(id), bytes, ct);
-                    dvr.Add(new DvrSeg(id, pendingDur > 0 ? pendingDur : 6.0, DateTime.UtcNow,
-                        pendingDisc || extDisc || gap, bytes.LongLength));
-
-                    lastSeq = seq;
-                    pendingDisc = false; extDisc = false; pendingDur = 0;
                 }
             }
 
@@ -316,9 +361,16 @@ async Task IngestLoopAsync(CancellationToken ct)
             }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
-        catch (Exception ex) { log.LogWarning("DVR loop error: {Msg}", ex.Message); }
+        catch (Exception ex) { health.Fail(ex.Message); log.LogWarning("DVR loop error: {Msg}", ex.Message); }
 
-        await Task.Delay(dvrPoll, ct);
+        // Poll normally when healthy; back off up to 30s when the source is down so
+        // we don't hammer a dead URL or spam the log. POST /set wakes us early so a
+        // newly-pasted URL is picked up at once.
+        int fails = health.Snapshot().Failures;
+        var delay = fails == 0
+            ? dvrPoll
+            : TimeSpan.FromSeconds(Math.Min(30, dvrPoll.TotalSeconds * Math.Pow(2, Math.Min(fails, 4))));
+        await recorderWake.WaitAsync(delay, ct);
     }
 }
 
@@ -343,6 +395,7 @@ app.MapPost("/set", async (HttpRequest request) =>
 
     state.Set(url);
     log.LogInformation("Active stream set -> {Url}", url);
+    if (recorderWake.CurrentCount == 0) recorderWake.Release(); // wake the recorder now
     return Results.NoContent();
 });
 
@@ -362,19 +415,32 @@ app.MapGet("/stream.m3u8", async (HttpResponse response, HttpClient http, Cancel
     using var upstream = await SendUpstreamAsync(http, playlistUrl, "Playlist", ct);
     if (upstream is null)
     {
+        health.Fail("upstream unreachable");
         response.StatusCode = StatusCodes.Status502BadGateway;
         await response.WriteAsync("Upstream playlist unreachable after retries.", ct);
         return;
     }
     if (!upstream.IsSuccessStatusCode)
     {
+        health.Fail($"upstream returned HTTP {(int)upstream.StatusCode}");
         log.LogWarning("Playlist upstream returned {Status}", (int)upstream.StatusCode);
         response.StatusCode = (int)upstream.StatusCode;
         return;
     }
 
-    // Return the playlist verbatim — its relative segment names route back here.
     var body = await upstream.Content.ReadAsStringAsync(ct);
+    if (!LooksLikeHlsPlaylist(body))
+    {
+        // 200 OK but not HLS — the source URL was likely repurposed. Don't hand the
+        // player a garbage "playlist"; signal failure so the UI can explain.
+        health.Fail("not a valid HLS playlist (the source URL may have changed)");
+        response.StatusCode = StatusCodes.Status502BadGateway;
+        await response.WriteAsync("The source did not return a valid HLS playlist.", ct);
+        return;
+    }
+
+    // Return the playlist verbatim — its relative segment names route back here.
+    health.Ok();
     response.StatusCode = 200;
     response.ContentType = "application/vnd.apple.mpegurl";
     response.Headers.CacheControl = "no-cache, no-store";
@@ -479,6 +545,21 @@ app.MapGet("/dvr/status", () =>
     });
 });
 
+// Upstream health, for the UI to show a friendly banner when the source is down.
+app.MapGet("/health", () =>
+{
+    var h = health.Snapshot();
+    return Results.Json(new
+    {
+        ok = h.Ok,
+        hasStream = state.PlaylistUrl is not null,
+        error = h.Error,
+        failures = h.Failures,
+        lastOkUtc = h.LastOkUtc,
+        lastSegmentUtc = h.LastSegmentUtc,
+    });
+});
+
 // Call 2: every segment (or sub-playlist) the player requests by relative name.
 app.MapGet("/{*path}", async (string path, HttpResponse response, HttpClient http, CancellationToken ct) =>
 {
@@ -562,36 +643,48 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
      so there's no magic-number video height to break when controls wrap. */
   html, body { height:100%; }
   body { margin:0; background:#111; color:#eee; font:14px system-ui, sans-serif; display:flex; flex-direction:column; }
-  header { display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:10px; background:#1b1b1b; border-bottom:1px solid #333; }
+  /* Two groups (URL+OK, and the control buttons). On desktop they sit on one row;
+     on phones each group becomes a full-width row, so nothing gets squeezed. */
+  header { display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:8px 10px; background:#1b1b1b; border-bottom:1px solid #333; }
+  .grp { display:flex; align-items:center; gap:8px; }
+  .grp.url { flex:1 1 300px; min-width:0; }
+  .grp.ctl { flex:0 1 auto; }
   /* font-size:16px on the input stops iOS from zooming in on focus. */
-  input { flex:1 1 240px; min-width:0; padding:10px; border:1px solid #444; border-radius:4px; background:#222; color:#eee; font-size:16px; }
-  button, a.dl { padding:10px 16px; border:0; border-radius:4px; background:#2d7; color:#000; font-weight:600; font-size:14px; cursor:pointer; white-space:nowrap; text-align:center; }
+  input { flex:1 1 auto; min-width:0; padding:10px; border:1px solid #444; border-radius:6px; background:#222; color:#eee; font-size:16px; }
+  button, a.dl { padding:10px 14px; border:0; border-radius:6px; background:#2d7; color:#000; font-weight:600; font-size:14px; line-height:1; cursor:pointer; white-space:nowrap; text-align:center; display:inline-flex; align-items:center; justify-content:center; }
   button.alt, a.dl { background:#345; color:#eee; }
   a.dl { text-decoration:none; }
   button.active { outline:2px solid #2d7; outline-offset:-2px; }
-  google-cast-launcher { width:36px; height:36px; flex:0 0 auto; cursor:pointer; --connected-color:#2d7; --disconnected-color:#eee; }
+  google-cast-launcher { width:38px; height:38px; flex:0 0 auto; cursor:pointer; --connected-color:#2d7; --disconnected-color:#eee; }
   #status { padding:4px 10px; color:#999; font-size:12px; min-height:16px; }
+  #banner { display:none; padding:10px 12px; background:#5a1f1f; color:#ffd9d9; border-bottom:1px solid #803030; font-size:14px; }
+  #banner.show { display:block; }
   video { flex:1 1 auto; width:100%; min-height:0; background:#000; display:block; }
 
-  /* Narrow screens: the URL field takes its own row; the action controls share
-     the next row and grow to fill it for comfortable tap targets. */
-  @media (max-width:640px) {
-    input { flex-basis:100%; }
-    button, a.dl { flex:1 1 auto; min-height:44px; display:flex; align-items:center; justify-content:center; }
+  /* Phones: stack the two groups into full-width rows; the control buttons share
+     their row and grow for comfortable tap targets. */
+  @media (max-width:600px) {
+    .grp.url, .grp.ctl { flex:1 1 100%; }
+    .grp.ctl > button, .grp.ctl > a.dl { flex:1 1 auto; min-height:44px; }
   }
 </style>
 </head>
 <body>
   <header>
-    <input id="url" placeholder="Paste playlist URL, e.g. https://.../usergenx...-got.htm"
-           value="{{System.Net.WebUtility.HtmlEncode(current ?? "")}}"
-           onkeydown="if(event.key==='Enter')load()">
-    <button onclick="load()">OK</button>
-    <button id="btnLive" class="alt" onclick="goLive()" title="Live edge">Live</button>
-    <button id="btnDvr" class="alt" onclick="goDvr()" title="Timeshift / DVR — scrub back through the recorded window">DVR</button>
-    <a class="dl" href="/dvr/export.ts" title="Download the recorded buffer as one .ts file">&#8595; .ts</a>
-    <google-cast-launcher id="castbtn" title="Cast to a Chromecast (open this page via your LAN IP, not localhost)"></google-cast-launcher>
+    <div class="grp url">
+      <input id="url" placeholder="Paste playlist URL…"
+             value="{{System.Net.WebUtility.HtmlEncode(current ?? "")}}"
+             onkeydown="if(event.key==='Enter')load()">
+      <button onclick="load()">OK</button>
+    </div>
+    <div class="grp ctl">
+      <button id="btnLive" class="alt" onclick="goLive()" title="Live edge">Live</button>
+      <button id="btnDvr" class="alt" onclick="goDvr()" title="Timeshift / DVR — scrub back through the recorded window">DVR</button>
+      <a class="dl" href="/dvr/export.ts" title="Download the recorded buffer as one .ts file">&#8595; .ts</a>
+      <google-cast-launcher id="castbtn" title="Cast to a Chromecast (open this page via your LAN IP, not localhost)"></google-cast-launcher>
+    </div>
   </header>
+  <div id="banner"></div>
   <div id="status"></div>
   <video id="v" controls autoplay playsinline></video>
 
@@ -678,7 +771,7 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
         hls.attachMedia(v);
         hls.on(Hls.Events.MANIFEST_PARSED, function () { v.play(); setStatus(live ? 'Playing (live)' : 'Playing (DVR — drag the seek bar to rewind)'); });
         hls.on(Hls.Events.ERROR, function (e, d) {
-          if (d.fatal) setStatus('Error: ' + d.type + ' / ' + d.details);
+          if (d.fatal) { setStatus('Error: ' + d.type + ' / ' + d.details); refreshHealth(); }
         });
       } else {
         // Safari / native HLS
@@ -714,10 +807,28 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
       }).catch(function () {});
     }
 
+    // Show a friendly banner when the upstream source is unavailable / changed.
+    function refreshHealth() {
+      fetch('/health').then(function (r) { return r.json(); }).then(function (h) {
+        var b = document.getElementById('banner');
+        if (!h.hasStream) {
+          b.className = ''; b.textContent = '';
+        } else if (h.ok === false) {
+          b.textContent = '⚠ Source unavailable' + (h.error ? ' — ' + h.error : '') +
+            '. The provider link may have changed; paste a working URL above and press OK. (Recording is paused; the DVR buffer is kept.)';
+          b.className = 'show';
+        } else {
+          b.className = ''; b.textContent = '';
+        }
+      }).catch(function () {});
+    }
+
     // If the Cast SDK was already ready before this script ran, init now.
     window.initCast();
     refreshDvr();
+    refreshHealth();
     setInterval(refreshDvr, 15000);
+    setInterval(refreshHealth, 10000);
 
     // Auto-start if a URL was pre-loaded at server startup.
     if (document.getElementById('url').value.trim()) start();
@@ -747,6 +858,32 @@ sealed class StreamState
     public (string? PlaylistUrl, string? BaseUrl) Snapshot()
     {
         lock (_gate) return (PlaylistUrl, BaseUrl);
+    }
+}
+
+
+// Tracks upstream health so the UI can warn when the source is down/changed. Ok()
+// is called on a valid playlist fetch, Fail() on any failure; the recorder and the
+// live /stream.m3u8 handler both feed it.
+sealed record HealthSnapshot(bool Ok, DateTime? LastOkUtc, DateTime? LastSegmentUtc, string? Error, int Failures);
+
+sealed class StreamHealth
+{
+    readonly object _gate = new();
+    DateTime? _lastOk, _lastSeg;
+    string? _error;
+    int _failures;
+    bool _everOk;
+
+    public void Ok()      { lock (_gate) { _lastOk = DateTime.UtcNow; _error = null; _failures = 0; _everOk = true; } }
+    public void Segment() { lock (_gate) { _lastSeg = DateTime.UtcNow; } }
+    public void Fail(string error) { lock (_gate) { _error = error; _failures++; } }
+
+    public HealthSnapshot Snapshot()
+    {
+        // Ok == the last fetch attempt succeeded (failures reset to 0 on Ok) and we've
+        // succeeded at least once. Failing => Ok is false and Error explains why.
+        lock (_gate) return new HealthSnapshot(_failures == 0 && _everOk, _lastOk, _lastSeg, _error, _failures);
     }
 }
 
