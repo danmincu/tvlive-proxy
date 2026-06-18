@@ -12,6 +12,7 @@ services:
       # PROXY_PLAYLIST_URL: "https://alpha1.yosefina1.cfd/ah1/usergenx304Jtlrnd2-got.htm"
       PROXY_ORIGIN: "https://canale-tv.net"
       PROXY_REFERER: "https://canale-tv.net/"
-      # For Chromecast when reaching the player via a DDNS/public hostname: the
-      # proxy's LAN IP, so the Chromecast fetches media locally (no router port needed).
-      PROXY_CAST_HOST: "192.168.1.54"
+      # Chromecast media host (the proxy's LAN IP) so casting works even when the
+      # player is opened via a DDNS/public hostname. run.sh auto-detects and exports
+      # this; empty falls back to the browser's hostname. Override: PROXY_CAST_HOST=<ip> ./run.sh
+      PROXY_CAST_HOST: "${PROXY_CAST_HOST:-}"
