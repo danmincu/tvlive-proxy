@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 
@@ -116,10 +117,20 @@ void AddBrowserHeaders(HttpRequestMessage req)
 }
 
 // The web UI: a URL box + an HLS video player.
-app.MapGet("/", (HttpResponse response) =>
+app.MapGet("/", (HttpContext ctx) =>
 {
-    response.ContentType = "text/html; charset=utf-8";
-    return response.WriteAsync(IndexPage(state.PlaylistUrl, port));
+    // The Chromecast is on the same LAN as this server, so hand it the server's
+    // LAN IP for the media fetch — NOT the address the browser used (which may be
+    // a public DDNS hostname the Chromecast can't reach without port-forwarding
+    // 13001 + NAT loopback). This is the local endpoint of the incoming socket;
+    // for DDNS access the router forwards to that same NIC, so it's still the LAN IP.
+    var local = ctx.Connection.LocalIpAddress;
+    string castHost = (local is null || IPAddress.IsLoopback(local))
+        ? "" // loopback (localhost) — fall back to the browser's hostname client-side
+        : (local.AddressFamily == AddressFamily.InterNetworkV6 ? $"[{local}]" : local.ToString());
+
+    ctx.Response.ContentType = "text/html; charset=utf-8";
+    return ctx.Response.WriteAsync(IndexPage(state.PlaylistUrl, port, castHost));
 });
 
 // Set / change the active upstream URL. Body is the raw URL (text/plain).
@@ -221,7 +232,7 @@ app.Run();
 
 // The single-page player. hls.js drives playback in Chrome/Firefox; Safari
 // falls back to the browser's native HLS support.
-static string IndexPage(string? current, int httpPort) => $$"""
+static string IndexPage(string? current, int httpPort, string castHost) => $$"""
 <!doctype html>
 <html>
 <head>
@@ -297,8 +308,10 @@ static string IndexPage(string? current, int httpPort) => $$"""
       var session = isCasting();
       if (!session) return;
       // The Chromecast can't validate our self-signed cert, so always hand it the
-      // plain-http endpoint (same host, http port) regardless of how this page was opened.
-      var castBase = 'http://' + window.location.hostname + ':' + {{httpPort}};
+      // plain-http endpoint. Prefer the server's LAN IP (injected) since the
+      // Chromecast is local; fall back to the browser's hostname (localhost case).
+      var castHost = "{{castHost}}" || window.location.hostname;
+      var castBase = 'http://' + castHost + ':' + {{httpPort}};
       var url = castBase + '/stream.m3u8?t=' + Date.now();
       var info = new chrome.cast.media.MediaInfo(url, 'application/x-mpegurl');
       info.streamType = chrome.cast.media.StreamType.LIVE;
