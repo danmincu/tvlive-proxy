@@ -3,3 +3,7 @@
 /dvr
 /dvr_test
 .env
+resolver/node_modules
+resolver/package-lock.json
+resolver/shots
+resolver/run*.log

@@ -1,22 +1,22 @@
 // rdslive-resolver
 // --------------------------------------------------------------------------
-// The provider rotates the HLS playlist URL (host, sometimes token) every few
-// hours. A real user has to open the ad-heavy player page, hit play, and read the
-// "...-got.htm" request off DevTools. This service automates that with a headless
-// (stealth) Chromium: it loads the player page, captures the playlist request the
-// player fires, verifies it, and POSTs it to rdslive-proxy's /admin/source.
+// Auto-discovers the rotating HLS playlist URL from the public player page and
+// pushes it to rdslive-proxy's /admin/source, so the source stays fresh with no
+// manual pasting.
 //
-// Trigger: reactive (polls the proxy's /health; resolves when down/stalled) + a
-// periodic safety re-resolve. A min-interval guard avoids hammering the source page.
+// The player only fetches the stream if the browser has real H.264/AAC codecs, so
+// we drive REAL Google Chrome (channel:'chrome'), not Playwright's codec-less
+// Chromium. We also stub window.open (releases the player's ad gate) and click the
+// player center (clearing ad overlays) to start playback, then capture the URL.
 //
-// When capture fails it dumps diagnostics (candidate requests, page title, frames,
-// and a screenshot/HTML to DEBUG_DIR) so the flow can be tuned without guessing.
+// Trigger: reactive (polls /health; resolves when down/stalled) + periodic safety.
 // --------------------------------------------------------------------------
 import { chromium } from 'playwright-extra';
 import stealth from 'puppeteer-extra-plugin-stealth';
-import { promises as fs } from 'fs';
 
 chromium.use(stealth());
+process.on('unhandledRejection', (e) => console.log('[resolver] unhandledRejection:', e && e.message));
+process.on('uncaughtException', (e) => console.log('[resolver] uncaughtException:', e && e.message));
 
 const PROXY_BASE   = process.env.PROXY_BASE        || 'http://rdslive-proxy:13001';
 const ADMIN_TOKEN  = process.env.PROXY_ADMIN_TOKEN || '';
@@ -24,162 +24,75 @@ const SOURCE_PAGE  = process.env.SOURCE_PAGE       || 'https://rdslive.org/anten
 const ORIGIN       = process.env.PROXY_ORIGIN      || 'https://canale-tv.net';
 const REFERER      = process.env.PROXY_REFERER     || 'https://canale-tv.net/';
 const UA = process.env.PROXY_UA ||
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36';
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
 
 const POLL_SECONDS     = +(process.env.RESOLVE_POLL_SECONDS     || 30);
 const PERIODIC_HOURS   = +(process.env.RESOLVE_PERIODIC_HOURS   || 4);
 const MIN_INTERVAL_SEC = +(process.env.RESOLVE_MIN_INTERVAL_SEC || 120);
 const NAV_TIMEOUT_MS   = +(process.env.RESOLVE_NAV_TIMEOUT_MS   || 45000);
-const DEBUG_DIR        = process.env.DEBUG_DIR || '/tmp/resolver-debug';
-const SOURCE_REFERER   = process.env.SOURCE_REFERER || 'https://rdslive.org/';
-// Ad blocking is OFF by default: blocking ad networks trips the site's Google
-// "Funding Choices" anti-adblock wall, which blocks the player. Set BLOCK_ADS=1 to
-// re-enable (not recommended for this site). We dodge the occasional ad redirect by
-// retrying instead.
-const BLOCK_ADS = /^(1|true|yes)$/i.test(process.env.BLOCK_ADS || '');
-const ATTEMPTS  = Math.max(1, +(process.env.RESOLVE_ATTEMPTS || 3));
-// Headed by default (run under xvfb): protected players detect headless and refuse
-// to build the stream URL. Set HEADLESS=1 to force headless (faster, but blocked here).
-const HEADLESS  = /^(1|true|yes)$/i.test(process.env.HEADLESS || '');
-const AD_HOST_RE = new RegExp(process.env.AD_HOSTS_RE ||
-  'ketogo|doubleclick|googlesyndication|googleadservices|googletagservices|google-analytics|googletagmanager|adservice|adnxs|taboola|outbrain|popads|popcash|propeller|onclick|onclck|exoclick|adsterra|hilltopads|juicyads|clickadu|monetag|bidvertiser|ad-?maven|pushwhy|histats|amung\\.us|yandex|quantserve|scorecardresearch|moatads|criteo|smartadserver|adskeeper|mgid|revcontent',
-  'i');
-// What a playlist request looks like — disguised "...-got.htm" OR a real ".m3u8",
-// on any host (the provider rotates the whole domain).
-const CAPTURE_RE = new RegExp(process.env.RESOLVE_PATTERN || '(-got\\.htm|\\.m3u8)');
-// Looser net for diagnostics — anything that might be the stream.
-const CANDIDATE_RE = /m3u8|got\.htm|tokenized|\.cfd|playlist|\.ts(\?|$)|embed|player|stream/i;
+const HEADLESS         = /^(1|true|yes)$/i.test(process.env.HEADLESS || ''); // default headed (under xvfb)
 
 const log = (...a) => console.log(new Date().toISOString(), '[resolver]', ...a);
 
 let busy = false;
 let lastResolveAt = 0;
 
-async function tryPlay(page) {
-  const sels = [
-    '#click-to-play', '#player', '.play-wrapper', '[data-player]', '.clappr-style',  // this player (Clappr)
-    '.jw-icon-display', '.jwplayer', '.vjs-big-play-button', '.video-js',
-    'button[aria-label*="play" i]', '.plyr__control--overlaid', '.play-button', '.play', 'video',
-  ];
-  for (const f of page.frames()) {
-    // Directly start any <video> (muted, to satisfy autoplay) and click play UIs.
-    try { await f.evaluate(() => { const v = document.querySelector('video'); if (v) { v.muted = true; const p = v.play && v.play(); if (p && p.catch) p.catch(() => {}); } }); } catch {}
-    for (const sel of sels) { try { await f.click(sel, { timeout: 300 }); } catch {} }
-    for (const pos of [{ x: 240, y: 160 }, { x: 480, y: 270 }, { x: 640, y: 360 }]) {
-      try { await f.click('body', { position: pos, timeout: 300 }); } catch {}
-    }
-  }
-}
-
-// Look INSIDE the player iframe(s) for the stream URL / how it's obtained: the
-// <video> src, what the frame actually fetched (resource timings), and any
-// stream-ish URLs embedded in its HTML/JS. Also dumps each player frame's HTML.
-async function inspectPlayerFrames(page) {
-  for (const f of page.frames()) {
-    const u = f.url();
-    if (!/canale-tv|tv\.php/i.test(u)) continue;
-    try {
-      const info = await f.evaluate(() => {
-        const v = document.querySelector('video');
-        const html = document.documentElement.outerHTML;
-        const STREAMISH = /\.cfd|\.m3u8|got\.htm|tokenized|playlist/i;
-        const urlRe = /(https?:\/\/[^\s"'<>()]+)/g;
-        const inHtml = Array.from(new Set((html.match(urlRe) || []).filter((x) => STREAMISH.test(x)))).slice(0, 25);
-        let res = [];
-        try { res = performance.getEntriesByType('resource').map((e) => e.name).filter((x) => STREAMISH.test(x)).slice(0, 25); } catch {}
-        return {
-          videoSrc: v ? (v.currentSrc || v.src || '') : '(no <video>)',
-          videoReady: v ? v.readyState : null,
-          inHtml, res, htmlLen: html.length,
-        };
-      });
-      log('DIAG player frame:', u);
-      log('   video.src   =', info.videoSrc, '| readyState =', info.videoReady, '| htmlLen =', info.htmlLen);
-      log('   fetched (stream-ish):', JSON.stringify(info.res));
-      log('   urls in html (stream-ish):', JSON.stringify(info.inHtml));
-      try {
-        const name = u.replace(/[^a-z0-9]+/gi, '_').slice(0, 60);
-        await fs.writeFile(`${DEBUG_DIR}/frame-${name}.html`, await f.content()).catch(() => {});
-      } catch {}
-    } catch (e) { log('DIAG frame inspect failed for', u, '-', e?.message); }
-  }
-}
-
-async function dumpDiagnostics(page, candidates, hosts) {
-  let title = '', url = '';
-  try { title = await page.title(); } catch {}
-  try { url = page.url(); } catch {}
-  const frames = page.frames().map((f) => f.url()).filter((u) => u && u !== 'about:blank');
-  log('DIAG title =', JSON.stringify(title), '| final url =', url);
-  log('DIAG frames:', frames.slice(0, 12).join('  |  ') || '(none)');
-  log('DIAG all hosts contacted:', [...hosts].sort().join(', ') || '(none)');
-  log('DIAG candidate requests seen (' + candidates.length + '):');
-  candidates.slice(0, 40).forEach((u) => log('   .', u));
-  try {
-    await fs.mkdir(DEBUG_DIR, { recursive: true });
-    await inspectPlayerFrames(page);
-  } catch {}
-  try {
-    const ts = new Date().toISOString().replace(/[:.]/g, '-');
-    await page.screenshot({ path: `${DEBUG_DIR}/fail-${ts}.png` }).catch(() => {});
-    await fs.writeFile(`${DEBUG_DIR}/fail-${ts}.html`, await page.content().catch(() => '')).catch(() => {});
-    log('DIAG saved screenshot + html under', DEBUG_DIR);
-  } catch (e) { log('DIAG dump failed:', e?.message); }
-}
-
+// Drive real Chrome to the player, start playback, capture the rotating URL.
+// Prefers the "...-got.htm" media playlist (what the proxy/DVR expect) over the
+// bare ".m3u8" master.
 async function captureUrl() {
   const browser = await chromium.launch({
+    channel: 'chrome', // real Chrome = has H.264/AAC; codec-less Chromium fails here
     headless: HEADLESS,
-    args: [
-      '--no-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled',
-      '--autoplay-policy=no-user-gesture-required', // let the player auto-start so it fetches the stream
-    ],
+    args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled', '--autoplay-policy=no-user-gesture-required'],
   });
   try {
     const ctx = await browser.newContext({ userAgent: UA, viewport: { width: 1280, height: 720 } });
-
-    // Neutralize popunders/redirect helpers before any page script runs.
+    // Stub window.open: the player's ad SDK needs it to return a window object, else
+    // it locks the player behind a "correct iframe setting" message.
     await ctx.addInitScript(() => {
-      try { window.open = () => null; } catch (e) {}
+      try { const s = { closed: false, close() {}, focus() {}, blur() {}, postMessage() {}, location: { href: '' }, document: { write() {}, close() {} } }; window.open = () => s; } catch (e) {}
     });
 
-    let captured = null;
-    const seen = new Set();
-    const candidates = [];
-    const hosts = new Set();
-    ctx.on('request', (req) => {
-      const u = req.url();
-      try { hosts.add(new URL(u).host); } catch {}
-      if (!captured && CAPTURE_RE.test(u)) captured = u;
-      if (CANDIDATE_RE.test(u) && !seen.has(u)) { seen.add(u); candidates.push(u); }
+    let best = null, alt = null;
+    ctx.on('request', (r) => {
+      const u = r.url();
+      if (/-got\.htm/i.test(u)) best = best || u;
+      else if (/\.m3u8(\?|$)/i.test(u)) alt = alt || u;
     });
 
     const page = await ctx.newPage();
-    await page.route('**/*', (route) => {
-      const req = route.request();
-      const t = req.resourceType();
-      let host = '';
-      try { host = new URL(req.url()).host; } catch {}
-      // Drop heavy noise. Only block ad networks if explicitly enabled (it triggers
-      // the anti-adblock wall here, so it's off by default).
-      if (t === 'image' || t === 'font') return route.abort();
-      if (BLOCK_ADS && AD_HOST_RE.test(host)) return route.abort();
-      return route.continue();
-    });
-    // Load with the antena-1 referer (the player page may expect it).
-    await page.goto(SOURCE_PAGE, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS, referer: SOURCE_REFERER }).catch(() => {});
+    await page.goto(SOURCE_PAGE, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS, referer: 'https://rdslive.org/' }).catch(() => {});
+    await page.waitForTimeout(5000);
+    if (page.url().includes('#google_vignette')) { await page.goBack().catch(() => {}); await page.waitForTimeout(1500); }
 
-    // Poke the player to start (it won't fetch the stream until it begins playing).
-    // Repeat every few seconds — the player iframe may still be loading at first.
-    const deadline = Date.now() + NAV_TIMEOUT_MS;
-    let lastClick = 0;
-    while (!captured && Date.now() < deadline) {
-      await page.waitForTimeout(700);
-      if (!captured && Date.now() - lastClick > 3500) { lastClick = Date.now(); await tryPlay(page); }
+    const cf = page.frames().find((fr) => /canale-tv|tv\.php/i.test(fr.url()));
+    if (cf) {
+      try {
+        const fe = await cf.frameElement();
+        await fe.scrollIntoViewIfNeeded().catch(() => {});
+        const box = await fe.boundingBox();
+        if (box) {
+          const cx = box.x + box.width / 2, cy = box.y + box.height / 2;
+          for (let k = 0; k < 8 && !best; k++) {
+            // Peel ad/clickjack overlays sitting over the player, then click it.
+            await page.evaluate(({ cx, cy }) => {
+              for (let n = 0; n < 10; n++) {
+                const el = document.elementFromPoint(cx, cy);
+                if (!el || el === document.body) break;
+                if (el.tagName === 'IFRAME' && /tv\.php|rdslive/i.test(el.src || '')) break;
+                el.style.setProperty('display', 'none', 'important');
+              }
+            }, { cx, cy }).catch(() => {});
+            await page.mouse.click(cx, cy);
+            await page.waitForTimeout(2500);
+          }
+        }
+      } catch (e) { log('click err:', e?.message?.split('\n')[0]); }
     }
-
-    if (!captured) await dumpDiagnostics(page, candidates, hosts);
-    return captured;
+    // brief grace so the preferred -got.htm arrives alongside the .m3u8
+    if (!best && alt) await page.waitForTimeout(1500);
+    return best || alt;
   } finally {
     await browser.close().catch(() => {});
   }
@@ -187,10 +100,7 @@ async function captureUrl() {
 
 async function verify(url) {
   try {
-    const r = await fetch(url, {
-      headers: { accept: '*/*', origin: ORIGIN, referer: REFERER, 'user-agent': UA },
-      signal: AbortSignal.timeout(15000),
-    });
+    const r = await fetch(url, { headers: { accept: '*/*', origin: ORIGIN, referer: REFERER, 'user-agent': UA }, signal: AbortSignal.timeout(15000) });
     if (!r.ok) return false;
     const text = await r.text();
     return text.replace(/^﻿/, '').trimStart().startsWith('#EXTM3U');
@@ -206,11 +116,7 @@ async function proxyGetCurrent() {
 }
 
 async function proxyPush(url) {
-  const r = await fetch(PROXY_BASE + '/admin/source', {
-    method: 'POST',
-    headers: { 'X-Admin-Token': ADMIN_TOKEN, 'Content-Type': 'text/plain' },
-    body: url,
-  });
+  const r = await fetch(PROXY_BASE + '/admin/source', { method: 'POST', headers: { 'X-Admin-Token': ADMIN_TOKEN, 'Content-Type': 'text/plain' }, body: url });
   return r.ok;
 }
 
@@ -229,12 +135,8 @@ async function resolve(reason) {
   lastResolveAt = Date.now();
   try {
     log('resolving...', reason);
-    let url = null;
-    for (let attempt = 1; attempt <= ATTEMPTS && !url; attempt++) {
-      if (attempt > 1) log('retry attempt', attempt, 'of', ATTEMPTS, '(prior attempt hit an ad redirect or no capture)');
-      url = await captureUrl();
-    }
-    if (!url) { log('no playlist URL captured after', ATTEMPTS, 'attempts'); return; }
+    const url = await captureUrl();
+    if (!url) { log('no playlist URL captured'); return; }
     log('captured:', url);
     if (!(await verify(url))) { log('verification failed (not an HLS playlist), ignoring'); return; }
     const current = await proxyGetCurrent();
@@ -249,10 +151,8 @@ async function resolve(reason) {
 
 async function main() {
   if (!ADMIN_TOKEN) { log('FATAL: PROXY_ADMIN_TOKEN is not set'); process.exit(1); }
-  log('started. page=', SOURCE_PAGE, 'proxy=', PROXY_BASE, 'pattern=', CAPTURE_RE.source);
-
+  log('started. page=', SOURCE_PAGE, 'proxy=', PROXY_BASE, 'headless=', HEADLESS);
   await resolve('startup');
-
   setInterval(async () => { if (await proxyDown()) await resolve('stalled/down'); }, POLL_SECONDS * 1000);
   setInterval(() => resolve('periodic'), PERIODIC_HOURS * 3600 * 1000);
 }
