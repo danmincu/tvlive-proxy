@@ -63,6 +63,12 @@ TimeSpan dvrRetention = TimeSpan.FromHours(
     double.TryParse(Environment.GetEnvironmentVariable("PROXY_DVR_HOURS"), NumberStyles.Float, CultureInfo.InvariantCulture, out var dh) ? dh : 24);
 TimeSpan dvrPoll = TimeSpan.FromSeconds(
     double.TryParse(Environment.GetEnvironmentVariable("PROXY_DVR_POLL_SECONDS"), NumberStyles.Float, CultureInfo.InvariantCulture, out var dp) ? dp : 4);
+// Secondary safety net: if free disk space drops below this many GB, prune the
+// oldest segments until back above it — regardless of the 24h retention. Guards
+// against a full disk if the bitrate spikes or something else eats the volume.
+// Set to 0 to disable.
+double dvrMinFreeGb = double.TryParse(Environment.GetEnvironmentVariable("PROXY_DVR_MIN_FREE_GB"), NumberStyles.Float, CultureInfo.InvariantCulture, out var mf) ? mf : 10;
+long dvrMinFreeBytes = (long)(dvrMinFreeGb * 1024 * 1024 * 1024);
 
 // The currently-selected upstream stream. Mutated when the user submits the
 // form (POST /set), or pre-loaded from the CLI arg / env var below.
@@ -300,6 +306,12 @@ async Task IngestLoopAsync(CancellationToken ct)
             {
                 int removed = dvr.PruneExpired(DateTime.UtcNow);
                 if (removed > 0) log.LogInformation("DVR: pruned {N} expired segments", removed);
+                if (dvrMinFreeBytes > 0)
+                {
+                    int freedSegs = dvr.PruneToFreeSpace(dvrMinFreeBytes);
+                    if (freedSegs > 0)
+                        log.LogWarning("DVR: low disk - pruned {N} oldest segments to keep >{Gb:0.#}GB free", freedSegs, dvrMinFreeGb);
+                }
                 lastPrune = DateTime.UtcNow;
             }
         }
@@ -546,16 +558,27 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>rdslive-proxy</title>
 <style>
-  body { margin:0; background:#111; color:#eee; font:14px system-ui, sans-serif; }
-  header { display:flex; gap:8px; padding:10px; background:#1b1b1b; border-bottom:1px solid #333; }
-  input { flex:1; padding:8px; border:1px solid #444; border-radius:4px; background:#222; color:#eee; }
-  button { padding:8px 16px; border:0; border-radius:4px; background:#2d7; color:#000; font-weight:600; cursor:pointer; }
-  button.alt { background:#345; color:#eee; }
-  button.active { outline:2px solid #2d7; }
-  a.dl { padding:8px 12px; border-radius:4px; background:#345; color:#eee; text-decoration:none; font-weight:600; white-space:nowrap; }
-  google-cast-launcher { width:32px; height:32px; flex:0 0 auto; cursor:pointer; --connected-color:#2d7; --disconnected-color:#eee; }
-  video { width:100%; height:calc(100vh - 80px); background:#000; display:block; }
+  /* Flex column layout: header (wraps freely) + status + video that fills the rest,
+     so there's no magic-number video height to break when controls wrap. */
+  html, body { height:100%; }
+  body { margin:0; background:#111; color:#eee; font:14px system-ui, sans-serif; display:flex; flex-direction:column; }
+  header { display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:10px; background:#1b1b1b; border-bottom:1px solid #333; }
+  /* font-size:16px on the input stops iOS from zooming in on focus. */
+  input { flex:1 1 240px; min-width:0; padding:10px; border:1px solid #444; border-radius:4px; background:#222; color:#eee; font-size:16px; }
+  button, a.dl { padding:10px 16px; border:0; border-radius:4px; background:#2d7; color:#000; font-weight:600; font-size:14px; cursor:pointer; white-space:nowrap; text-align:center; }
+  button.alt, a.dl { background:#345; color:#eee; }
+  a.dl { text-decoration:none; }
+  button.active { outline:2px solid #2d7; outline-offset:-2px; }
+  google-cast-launcher { width:36px; height:36px; flex:0 0 auto; cursor:pointer; --connected-color:#2d7; --disconnected-color:#eee; }
   #status { padding:4px 10px; color:#999; font-size:12px; min-height:16px; }
+  video { flex:1 1 auto; width:100%; min-height:0; background:#000; display:block; }
+
+  /* Narrow screens: the URL field takes its own row; the action controls share
+     the next row and grow to fill it for comfortable tap targets. */
+  @media (max-width:640px) {
+    input { flex-basis:100%; }
+    button, a.dl { flex:1 1 auto; min-height:44px; display:flex; align-items:center; justify-content:center; }
+  }
 </style>
 </head>
 <body>
@@ -802,6 +825,58 @@ sealed class DvrStore
         foreach (var s in removed)
             try { File.Delete(PathFor(s.Id)); } catch (IOException) { /* best effort */ }
         return removed.Count;
+    }
+
+    // Secondary protection: if free disk space is below minFreeBytes, delete the
+    // oldest segments (estimating by their recorded size) until we've freed enough.
+    // If free space can't be determined, do nothing (never blindly wipe the buffer).
+    public int PruneToFreeSpace(long minFreeBytes)
+    {
+        var free = AvailableFreeBytes(_segDir);
+        if (free is null || free.Value >= minFreeBytes) return 0;
+
+        long needed = minFreeBytes - free.Value;
+        List<DvrSeg> removed = new();
+        lock (_gate)
+        {
+            long freed = 0;
+            while (_segs.Count > 0 && freed < needed)
+            {
+                freed += _segs[0].Size;
+                removed.Add(_segs[0]);
+                _segs.RemoveAt(0);
+            }
+            if (removed.Count > 0) RewriteIndexLocked();
+        }
+        foreach (var s in removed)
+            try { File.Delete(PathFor(s.Id)); } catch (IOException) { }
+        return removed.Count;
+    }
+
+    // Free bytes on the filesystem that holds `path` (longest-matching mount, so
+    // it's correct for a separate volume/bind mount on Linux). Null if unknown.
+    static long? AvailableFreeBytes(string path)
+    {
+        try
+        {
+            var full = Path.GetFullPath(path);
+            DriveInfo? best = null;
+            foreach (var d in DriveInfo.GetDrives())
+            {
+                try
+                {
+                    if (!d.IsReady) continue;
+                    if (full.StartsWith(d.Name, StringComparison.OrdinalIgnoreCase) &&
+                        (best is null || d.Name.Length > best.Name.Length))
+                        best = d;
+                }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+            }
+            return best?.AvailableFreeSpace;
+        }
+        catch (IOException) { return null; }
+        catch (ArgumentException) { return null; }
     }
 
     // Load the index from disk on startup: parse, drop entries whose files are

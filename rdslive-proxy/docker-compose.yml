@@ -26,6 +26,9 @@ services:
       PROXY_DVR_ENABLED: "true"
       PROXY_DVR_HOURS: "24"
       # PROXY_DVR_POLL_SECONDS: "4"
+      # Safety net: prune oldest recordings if free disk drops below this many GB
+      # (independent of the 24h window). 0 disables. Protects against a full disk.
+      PROXY_DVR_MIN_FREE_GB: "10"
     volumes:
       - dvr-data:/app/dvr   # recordings persist across container rebuilds
 
