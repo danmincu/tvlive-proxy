@@ -32,9 +32,12 @@ const MIN_INTERVAL_SEC = +(process.env.RESOLVE_MIN_INTERVAL_SEC || 120);
 const NAV_TIMEOUT_MS   = +(process.env.RESOLVE_NAV_TIMEOUT_MS   || 45000);
 const DEBUG_DIR        = process.env.DEBUG_DIR || '/tmp/resolver-debug';
 const SOURCE_REFERER   = process.env.SOURCE_REFERER || 'https://rdslive.org/';
-// Ad / tracker / redirect networks to block so they can't hijack the page
-// (popunders, top-frame redirects like the keto landing page). The player's own
-// domains (rdslive.org, canale-tv.net, *.cfd) are NOT here, so the player loads.
+// Ad blocking is OFF by default: blocking ad networks trips the site's Google
+// "Funding Choices" anti-adblock wall, which blocks the player. Set BLOCK_ADS=1 to
+// re-enable (not recommended for this site). We dodge the occasional ad redirect by
+// retrying instead.
+const BLOCK_ADS = /^(1|true|yes)$/i.test(process.env.BLOCK_ADS || '');
+const ATTEMPTS  = Math.max(1, +(process.env.RESOLVE_ATTEMPTS || 3));
 const AD_HOST_RE = new RegExp(process.env.AD_HOSTS_RE ||
   'ketogo|doubleclick|googlesyndication|googleadservices|googletagservices|google-analytics|googletagmanager|adservice|adnxs|taboola|outbrain|popads|popcash|propeller|onclick|onclck|exoclick|adsterra|hilltopads|juicyads|clickadu|monetag|bidvertiser|ad-?maven|pushwhy|histats|amung\\.us|yandex|quantserve|scorecardresearch|moatads|criteo|smartadserver|adskeeper|mgid|revcontent',
   'i');
@@ -153,9 +156,10 @@ async function captureUrl() {
       const t = req.resourceType();
       let host = '';
       try { host = new URL(req.url()).host; } catch {}
-      // Drop heavy noise and ALL ad/redirect networks (so they can't hijack the tab).
+      // Drop heavy noise. Only block ad networks if explicitly enabled (it triggers
+      // the anti-adblock wall here, so it's off by default).
       if (t === 'image' || t === 'font') return route.abort();
-      if (AD_HOST_RE.test(host)) return route.abort();
+      if (BLOCK_ADS && AD_HOST_RE.test(host)) return route.abort();
       return route.continue();
     });
     // Load with the antena-1 referer (the player page may expect it).
@@ -221,8 +225,12 @@ async function resolve(reason) {
   lastResolveAt = Date.now();
   try {
     log('resolving...', reason);
-    const url = await captureUrl();
-    if (!url) { log('no playlist URL captured'); return; }
+    let url = null;
+    for (let attempt = 1; attempt <= ATTEMPTS && !url; attempt++) {
+      if (attempt > 1) log('retry attempt', attempt, 'of', ATTEMPTS, '(prior attempt hit an ad redirect or no capture)');
+      url = await captureUrl();
+    }
+    if (!url) { log('no playlist URL captured after', ATTEMPTS, 'attempts'); return; }
     log('captured:', url);
     if (!(await verify(url))) { log('verification failed (not an HLS playlist), ignoring'); return; }
     const current = await proxyGetCurrent();
