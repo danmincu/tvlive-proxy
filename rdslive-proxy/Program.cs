@@ -842,7 +842,7 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
         hls = new Hls({ liveSyncDuration: 12 });
         hls.loadSource(src);
         hls.attachMedia(v);
-        hls.on(Hls.Events.MANIFEST_PARSED, function () { v.play(); setStatus(live ? 'Playing (live)' : 'Playing (DVR — drag the seek bar to rewind)'); });
+        hls.on(Hls.Events.MANIFEST_PARSED, function () { v.play(); setStatus(live ? 'Playing (live)' : 'Playing (DVR — seek anywhere; re-click DVR for newer)'); });
         hls.on(Hls.Events.ERROR, function (e, d) {
           if (d.fatal) { setStatus('Error: ' + d.type + ' / ' + d.details); refreshHealth(); }
         });
@@ -854,9 +854,14 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
       }
     }
 
+    function isDvr() { return currentPath.indexOf('/dvr.m3u8') >= 0; }
+
     function start()  { play('/stream.m3u8'); }
     function goLive() { play('/stream.m3u8'); if (isCasting()) castLoad(); }
-    function goDvr()  { play('/dvr.m3u8');    if (isCasting()) castLoad(); }
+    // Load DVR as VOD (ENDLIST) so it's a fixed, fully-seekable recording — hls.js
+    // won't reload it or snap back to the live edge. Re-click DVR to pull in newer
+    // recordings (the VOD is a snapshot up to the moment you opened it).
+    function goDvr()  { play('/dvr.m3u8?vod=1'); if (isCasting()) castLoad(); }
 
     // Skip ±N seconds, clamped to the buffer's seekable range.
     function skip(delta) {
@@ -898,10 +903,12 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
         .catch(function (e) { alert('Failed: ' + e.message); });
     }
 
-    // Stall watchdog: if playback stops advancing while we believe we're playing,
-    // reload the current source to recover (e.g. a wedged hls.js after a freeze).
+    // Stall watchdog: if LIVE playback stops advancing while we believe we're playing,
+    // reload to recover (e.g. a wedged hls.js after a freeze). Never in DVR mode — a
+    // reload there would jump out of the recording the user is watching.
     var wdLastTime = 0, wdStalledSince = 0;
     setInterval(function () {
+      if (isDvr()) { wdStalledSince = 0; return; }
       if (v.paused || v.seeking || v.readyState < 2) { wdLastTime = v.currentTime; wdStalledSince = 0; return; }
       if (v.currentTime > wdLastTime + 0.25) { wdLastTime = v.currentTime; wdStalledSince = 0; return; }
       if (wdStalledSince === 0) { wdStalledSince = Date.now(); return; }
@@ -935,8 +942,9 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
           b.className = 'show';
         } else {
           b.className = ''; b.textContent = '';
-          // Recovered after being down — reload the current source to catch the live edge.
-          if (!lastHealthOk) play(currentPath);
+          // Recovered after being down — reload to catch the live edge, but only in
+          // live mode (don't yank someone out of the DVR recording they're watching).
+          if (!lastHealthOk && !isDvr()) play(currentPath);
         }
         lastHealthOk = (h.ok !== false);
       }).catch(function () {});
