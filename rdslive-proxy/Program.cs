@@ -427,16 +427,21 @@ app.MapGet("/", (HttpResponse response) =>
     return response.WriteAsync(IndexPage(state.PlaylistUrl, port, castHost));
 });
 
-// Set / change the active upstream URL. Body is the raw URL (text/plain).
+// Set / change the active upstream URL. Body is the raw URL (text/plain). Password-
+// protected (header X-Set-Password) since the resolver auto-heals the URL — only
+// someone with the password should override it manually.
 app.MapPost("/set", async (HttpRequest request) =>
 {
+    if (request.Headers["X-Set-Password"].ToString() != wipePassword)
+        return Results.StatusCode(StatusCodes.Status403Forbidden);
+
     using var reader = new StreamReader(request.Body);
     string url = (await reader.ReadToEndAsync()).Trim();
     if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) || (uri.Scheme != "http" && uri.Scheme != "https"))
         return Results.BadRequest("Provide an absolute http(s) URL.");
 
     state.Set(url);
-    log.LogInformation("Active stream set -> {Url}", url);
+    log.LogInformation("Active stream set (manual) -> {Url}", url);
     if (recorderWake.CurrentCount == 0) recorderWake.Release(); // wake the recorder now
     return Results.NoContent();
 });
@@ -655,6 +660,7 @@ app.MapGet("/health", () =>
         ok,
         stalled,
         hasStream = state.PlaylistUrl is not null,
+        currentUrl = state.PlaylistUrl,   // for the UI to show / roll back to
         error,
         failures = h.Failures,
         lastOkUtc = h.LastOkUtc,
@@ -939,17 +945,26 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
       if (v.paused) v.play();
     }
 
+    // Restore the URL field to the active (resolver-managed) URL.
+    function rollbackUrl() {
+      if (window.__currentUrl) document.getElementById('url').value = window.__currentUrl;
+    }
+
     function load() {
       var url = document.getElementById('url').value.trim();
       if (!url) return;
+      // The resolver auto-heals the URL, so a manual override needs the password.
+      var pw = prompt('Enter the password to change the stream URL:');
+      if (pw === null || pw === '') { rollbackUrl(); return; }
       setStatus('Loading...');
-      fetch('/set', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: url })
+      fetch('/set', { method: 'POST', headers: { 'Content-Type': 'text/plain', 'X-Set-Password': pw }, body: url })
         .then(function (r) {
+          if (r.status === 403) { alert('Wrong password — URL not changed.'); rollbackUrl(); return; }
           if (!r.ok) return r.text().then(function (t) { throw new Error(t || ('HTTP ' + r.status)); });
           start();
           if (isCasting()) castLoad();   // push the new stream to an active cast too
         })
-        .catch(function (e) { setStatus('Failed: ' + e.message); });
+        .catch(function (e) { setStatus('Failed: ' + e.message); rollbackUrl(); });
     }
 
     // Permanently delete all DVR recordings — strong warning + password.
@@ -996,6 +1011,13 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
     var lastHealthOk = true;
     function refreshHealth() {
       fetch('/health').then(function (r) { return r.json(); }).then(function (h) {
+        // Track the active (resolver-managed) URL; keep the field in sync unless the
+        // user is editing it. Used for rollback on a wrong password.
+        if (h.currentUrl) {
+          window.__currentUrl = h.currentUrl;
+          var inp = document.getElementById('url');
+          if (document.activeElement !== inp) inp.value = h.currentUrl;
+        }
         var b = document.getElementById('banner');
         if (!h.hasStream) {
           b.className = ''; b.textContent = '';
@@ -1017,6 +1039,9 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
     setInterval(saveDvrPos, 5000);
     v.addEventListener('pause', saveDvrPos);
     window.addEventListener('pagehide', saveDvrPos);
+
+    // Seed the rollback value with the URL the page loaded with.
+    window.__currentUrl = document.getElementById('url').value;
 
     // If the Cast SDK was already ready before this script ran, init now.
     window.initCast();
