@@ -11,4 +11,4 @@ info: Microsoft.Hosting.Lifetime[0] Content root path: C:\Github\tvlive-proxy\rd
 info: Microsoft.AspNetCore.Hosting.Diagnostics[1] Request starting HTTP/1.1 GET http://192.168.1.185:13001/ - - -
 info: Microsoft.AspNetCore.Routing.EndpointMiddleware[0] Executing endpoint 'HTTP: GET /'
 info: Microsoft.AspNetCore.Routing.EndpointMiddleware[1] Executed endpoint 'HTTP: GET /'
-info: Microsoft.AspNetCore.Hosting.Diagnostics[2] Request finished HTTP/1.1 GET http://192.168.1.185:13001/ - 200 - text/html;+charset=utf-8 33.2819ms
+info: Microsoft.AspNetCore.Hosting.Diagnostics[2] Request finished HTTP/1.1 GET http://192.168.1.185:13001/ - 200 - text/html;+charset=utf-8 33.9245ms

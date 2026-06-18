@@ -1,5 +1,4 @@
 using System.Net;
-using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 
@@ -38,6 +37,10 @@ int port = int.TryParse(Environment.GetEnvironmentVariable("PROXY_PORT"), out va
 // cast button never appears. We serve both: http for media/VLC/Chromecast, and
 // https (self-signed) for the player page so the cast button works.
 int httpsPort = int.TryParse(Environment.GetEnvironmentVariable("PROXY_HTTPS_PORT"), out var hp) ? hp : 13443;
+// Optional: the LAN IP/host the Chromecast should use to fetch media. Leave unset
+// to use the browser's own hostname (works when opening the player via the LAN IP);
+// set to e.g. "192.168.1.54" when reaching the player via a DDNS/public hostname.
+string castHost = Environment.GetEnvironmentVariable("PROXY_CAST_HOST") ?? "";
 
 // The currently-selected upstream stream. Mutated when the user submits the
 // form (POST /set), or pre-loaded from the CLI arg / env var below.
@@ -117,20 +120,14 @@ void AddBrowserHeaders(HttpRequestMessage req)
 }
 
 // The web UI: a URL box + an HLS video player.
-app.MapGet("/", (HttpContext ctx) =>
+app.MapGet("/", (HttpResponse response) =>
 {
-    // The Chromecast is on the same LAN as this server, so hand it the server's
-    // LAN IP for the media fetch — NOT the address the browser used (which may be
-    // a public DDNS hostname the Chromecast can't reach without port-forwarding
-    // 13001 + NAT loopback). This is the local endpoint of the incoming socket;
-    // for DDNS access the router forwards to that same NIC, so it's still the LAN IP.
-    var local = ctx.Connection.LocalIpAddress;
-    string castHost = (local is null || IPAddress.IsLoopback(local))
-        ? "" // loopback (localhost) — fall back to the browser's hostname client-side
-        : (local.AddressFamily == AddressFamily.InterNetworkV6 ? $"[{local}]" : local.ToString());
-
-    ctx.Response.ContentType = "text/html; charset=utf-8";
-    return ctx.Response.WriteAsync(IndexPage(state.PlaylistUrl, port, castHost));
+    // Cast media host: by default the browser uses its own address bar host
+    // (window.location.hostname) — correct when you open the player via the LAN IP.
+    // For DDNS/remote access the Chromecast can't reach the public hostname, so set
+    // PROXY_CAST_HOST to the proxy's LAN IP (e.g. 192.168.1.54) to override it.
+    response.ContentType = "text/html; charset=utf-8";
+    return response.WriteAsync(IndexPage(state.PlaylistUrl, port, castHost));
 });
 
 // Set / change the active upstream URL. Body is the raw URL (text/plain).

@@ -12,3 +12,6 @@ services:
       # PROXY_PLAYLIST_URL: "https://alpha1.yosefina1.cfd/ah1/usergenx304Jtlrnd2-got.htm"
       PROXY_ORIGIN: "https://canale-tv.net"
       PROXY_REFERER: "https://canale-tv.net/"
+      # For Chromecast when reaching the player via a DDNS/public hostname, set the
+      # proxy's LAN IP so the Chromecast fetches media locally (uncomment + edit):
+      # PROXY_CAST_HOST: "192.168.1.54"
