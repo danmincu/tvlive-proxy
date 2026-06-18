@@ -64,6 +64,40 @@ async function tryPlay(page) {
   }
 }
 
+// Look INSIDE the player iframe(s) for the stream URL / how it's obtained: the
+// <video> src, what the frame actually fetched (resource timings), and any
+// stream-ish URLs embedded in its HTML/JS. Also dumps each player frame's HTML.
+async function inspectPlayerFrames(page) {
+  for (const f of page.frames()) {
+    const u = f.url();
+    if (!/canale-tv|tv\.php/i.test(u)) continue;
+    try {
+      const info = await f.evaluate(() => {
+        const v = document.querySelector('video');
+        const html = document.documentElement.outerHTML;
+        const STREAMISH = /\.cfd|\.m3u8|got\.htm|tokenized|playlist/i;
+        const urlRe = /(https?:\/\/[^\s"'<>()]+)/g;
+        const inHtml = Array.from(new Set((html.match(urlRe) || []).filter((x) => STREAMISH.test(x)))).slice(0, 25);
+        let res = [];
+        try { res = performance.getEntriesByType('resource').map((e) => e.name).filter((x) => STREAMISH.test(x)).slice(0, 25); } catch {}
+        return {
+          videoSrc: v ? (v.currentSrc || v.src || '') : '(no <video>)',
+          videoReady: v ? v.readyState : null,
+          inHtml, res, htmlLen: html.length,
+        };
+      });
+      log('DIAG player frame:', u);
+      log('   video.src   =', info.videoSrc, '| readyState =', info.videoReady, '| htmlLen =', info.htmlLen);
+      log('   fetched (stream-ish):', JSON.stringify(info.res));
+      log('   urls in html (stream-ish):', JSON.stringify(info.inHtml));
+      try {
+        const name = u.replace(/[^a-z0-9]+/gi, '_').slice(0, 60);
+        await fs.writeFile(`${DEBUG_DIR}/frame-${name}.html`, await f.content()).catch(() => {});
+      } catch {}
+    } catch (e) { log('DIAG frame inspect failed for', u, '-', e?.message); }
+  }
+}
+
 async function dumpDiagnostics(page, candidates, hosts) {
   let title = '', url = '';
   try { title = await page.title(); } catch {}
@@ -76,6 +110,9 @@ async function dumpDiagnostics(page, candidates, hosts) {
   candidates.slice(0, 40).forEach((u) => log('   .', u));
   try {
     await fs.mkdir(DEBUG_DIR, { recursive: true });
+    await inspectPlayerFrames(page);
+  } catch {}
+  try {
     const ts = new Date().toISOString().replace(/[:.]/g, '-');
     await page.screenshot({ path: `${DEBUG_DIR}/fail-${ts}.png` }).catch(() => {});
     await fs.writeFile(`${DEBUG_DIR}/fail-${ts}.html`, await page.content().catch(() => '')).catch(() => {});
