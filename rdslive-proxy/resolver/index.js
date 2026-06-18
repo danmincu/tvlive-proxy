@@ -6,12 +6,15 @@
 // (stealth) Chromium: it loads the player page, captures the playlist request the
 // player fires, verifies it, and POSTs it to rdslive-proxy's /admin/source.
 //
-// Trigger: reactive (polls the proxy's /health; resolves when the stream is
-// down/stalled) + a periodic safety re-resolve. A min-interval guard avoids
-// hammering the source page.
+// Trigger: reactive (polls the proxy's /health; resolves when down/stalled) + a
+// periodic safety re-resolve. A min-interval guard avoids hammering the source page.
+//
+// When capture fails it dumps diagnostics (candidate requests, page title, frames,
+// and a screenshot/HTML to DEBUG_DIR) so the flow can be tuned without guessing.
 // --------------------------------------------------------------------------
 import { chromium } from 'playwright-extra';
 import stealth from 'puppeteer-extra-plugin-stealth';
+import { promises as fs } from 'fs';
 
 chromium.use(stealth());
 
@@ -23,20 +26,51 @@ const REFERER      = process.env.PROXY_REFERER     || 'https://canale-tv.net/';
 const UA = process.env.PROXY_UA ||
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36';
 
-const POLL_SECONDS     = +(process.env.RESOLVE_POLL_SECONDS     || 30);   // /health poll
-const PERIODIC_HOURS   = +(process.env.RESOLVE_PERIODIC_HOURS   || 4);    // proactive re-resolve
-const MIN_INTERVAL_SEC = +(process.env.RESOLVE_MIN_INTERVAL_SEC || 120);  // don't resolve more often than this
+const POLL_SECONDS     = +(process.env.RESOLVE_POLL_SECONDS     || 30);
+const PERIODIC_HOURS   = +(process.env.RESOLVE_PERIODIC_HOURS   || 4);
+const MIN_INTERVAL_SEC = +(process.env.RESOLVE_MIN_INTERVAL_SEC || 120);
 const NAV_TIMEOUT_MS   = +(process.env.RESOLVE_NAV_TIMEOUT_MS   || 45000);
-// What a playlist request looks like — matches alpha1.yosefina1.cfd/ah1/...-got.htm etc.
-const CAPTURE_RE = new RegExp(process.env.RESOLVE_PATTERN || '\\.cfd/.*-got\\.htm');
+const DEBUG_DIR        = process.env.DEBUG_DIR || '/tmp/resolver-debug';
+// What a playlist request looks like — disguised "...-got.htm" OR a real ".m3u8",
+// on any host (the provider rotates the whole domain).
+const CAPTURE_RE = new RegExp(process.env.RESOLVE_PATTERN || '(-got\\.htm|\\.m3u8)');
+// Looser net for diagnostics — anything that might be the stream.
+const CANDIDATE_RE = /m3u8|got\.htm|tokenized|\.cfd|playlist|\.ts(\?|$)|embed|player|stream/i;
 
 const log = (...a) => console.log(new Date().toISOString(), '[resolver]', ...a);
 
 let busy = false;
 let lastResolveAt = 0;
 
-// Launch headless Chromium, load the player page, and capture the first request
-// that matches the playlist signature (across the page and any ad popups).
+async function tryPlay(page) {
+  const sels = [
+    'button[aria-label*="play" i]', '.vjs-big-play-button', '.jw-icon-display',
+    '.plyr__control--overlaid', '#player', '.play-button', '.play', 'video',
+  ];
+  for (const f of page.frames()) {
+    for (const sel of sels) { try { await f.click(sel, { timeout: 400 }); } catch {} }
+    try { await f.click('body', { position: { x: 240, y: 160 }, timeout: 400 }); } catch {}
+  }
+}
+
+async function dumpDiagnostics(page, candidates) {
+  let title = '', url = '';
+  try { title = await page.title(); } catch {}
+  try { url = page.url(); } catch {}
+  const frames = page.frames().map((f) => f.url()).filter((u) => u && u !== 'about:blank');
+  log('DIAG title =', JSON.stringify(title), '| final url =', url);
+  log('DIAG frames:', frames.slice(0, 12).join('  |  ') || '(none)');
+  log('DIAG candidate requests seen (' + candidates.length + '):');
+  candidates.slice(0, 40).forEach((u) => log('   .', u));
+  try {
+    await fs.mkdir(DEBUG_DIR, { recursive: true });
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    await page.screenshot({ path: `${DEBUG_DIR}/fail-${ts}.png` }).catch(() => {});
+    await fs.writeFile(`${DEBUG_DIR}/fail-${ts}.html`, await page.content().catch(() => '')).catch(() => {});
+    log('DIAG saved screenshot + html under', DEBUG_DIR);
+  } catch (e) { log('DIAG dump failed:', e?.message); }
+}
+
 async function captureUrl() {
   const browser = await chromium.launch({
     headless: true,
@@ -46,12 +80,15 @@ async function captureUrl() {
     const ctx = await browser.newContext({ userAgent: UA, viewport: { width: 1280, height: 720 } });
 
     let captured = null;
+    const seen = new Set();
+    const candidates = [];
     ctx.on('request', (req) => {
-      if (!captured && CAPTURE_RE.test(req.url())) captured = req.url();
+      const u = req.url();
+      if (!captured && CAPTURE_RE.test(u)) captured = u;
+      if (CANDIDATE_RE.test(u) && !seen.has(u)) { seen.add(u); candidates.push(u); }
     });
 
     const page = await ctx.newPage();
-    // Drop heavy noise to speed things up (we only need the playlist request to fire).
     await page.route('**/*', (route) => {
       const t = route.request().resourceType();
       return (t === 'image' || t === 'font') ? route.abort() : route.continue();
@@ -59,31 +96,23 @@ async function captureUrl() {
 
     await page.goto(SOURCE_PAGE, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS }).catch(() => {});
 
-    // Wait for the playlist request; after a few seconds, try common play triggers
-    // in case a user gesture is required.
     const deadline = Date.now() + NAV_TIMEOUT_MS;
-    let clickedAt = 0;
+    let clicked = false;
     while (!captured && Date.now() < deadline) {
       await page.waitForTimeout(700);
-      if (!captured && !clickedAt && Date.now() > deadline - NAV_TIMEOUT_MS + 5000) {
-        clickedAt = Date.now();
-        for (const sel of [
-          'button[aria-label*="play" i]', '.vjs-big-play-button', '.jw-icon-display',
-          '.plyr__control--overlaid', 'video', '#player', '.play-button', '.play', 'body',
-        ]) {
-          try { await page.click(sel, { timeout: 800 }); } catch {}
-          if (captured) break;
-        }
+      if (!captured && !clicked && Date.now() > deadline - NAV_TIMEOUT_MS + 5000) {
+        clicked = true;
+        await tryPlay(page);
       }
     }
+
+    if (!captured) await dumpDiagnostics(page, candidates);
     return captured;
   } finally {
     await browser.close().catch(() => {});
   }
 }
 
-// Confirm the captured URL actually serves an HLS playlist (with the headers the
-// origin expects) before we push it — so we never set a broken source.
 async function verify(url) {
   try {
     const r = await fetch(url, {
@@ -117,7 +146,7 @@ async function proxyDown() {
   try {
     const r = await fetch(PROXY_BASE + '/health', { signal: AbortSignal.timeout(8000) });
     if (!r.ok) return true;
-    return (await r.json()).ok === false; // stalled or unreachable upstream
+    return (await r.json()).ok === false;
   } catch { return true; }
 }
 
@@ -127,7 +156,7 @@ async function resolve(reason) {
   busy = true;
   lastResolveAt = Date.now();
   try {
-    log('resolving…', reason);
+    log('resolving...', reason);
     const url = await captureUrl();
     if (!url) { log('no playlist URL captured'); return; }
     log('captured:', url);
