@@ -182,6 +182,7 @@ static string IndexPage(string? current) => $$"""
   header { display:flex; gap:8px; padding:10px; background:#1b1b1b; border-bottom:1px solid #333; }
   input { flex:1; padding:8px; border:1px solid #444; border-radius:4px; background:#222; color:#eee; }
   button { padding:8px 16px; border:0; border-radius:4px; background:#2d7; color:#000; font-weight:600; cursor:pointer; }
+  google-cast-launcher { width:32px; height:32px; flex:0 0 auto; cursor:pointer; --connected-color:#2d7; --disconnected-color:#eee; }
   video { width:100%; height:calc(100vh - 55px); background:#000; display:block; }
   #status { padding:4px 10px; color:#999; font-size:12px; min-height:16px; }
 </style>
@@ -192,10 +193,19 @@ static string IndexPage(string? current) => $$"""
            value="{{System.Net.WebUtility.HtmlEncode(current ?? "")}}"
            onkeydown="if(event.key==='Enter')load()">
     <button onclick="load()">OK</button>
+    <google-cast-launcher id="castbtn" title="Cast to a Chromecast (open this page via your LAN IP, not localhost)"></google-cast-launcher>
   </header>
   <div id="status"></div>
   <video id="v" controls autoplay playsinline></video>
 
+  <!-- Cast SDK calls this when the framework is ready; must exist before the SDK loads. -->
+  <script>
+    window['__onGCastApiAvailable'] = function (isAvailable) {
+      window.__castApiAvailable = isAvailable;
+      if (window.initCast) window.initCast();
+    };
+  </script>
+  <script src="https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1"></script>
   <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
   <script>
     var v = document.getElementById('v');
@@ -203,6 +213,48 @@ static string IndexPage(string? current) => $$"""
     var hls = null;
 
     function setStatus(t) { statusEl.textContent = t; }
+
+    // --- Chromecast ----------------------------------------------------------
+    // hls.js plays via MSE, which Chrome won't cast. So we use the Cast SDK to
+    // hand the Chromecast our /stream.m3u8 URL directly; its built-in receiver
+    // plays HLS, fetching segments through this proxy (same as VLC does).
+    var castContext = null;
+
+    window.initCast = function () {
+      if (castContext || !window.__castApiAvailable) return;
+      castContext = cast.framework.CastContext.getInstance();
+      castContext.setOptions({
+        receiverApplicationId: chrome.cast.media.DEFAULT_MEDIA_RECEIVER_APP_ID,
+        autoJoinPolicy: chrome.cast.AutoJoinPolicy.ORIGIN_SCOPED
+      });
+      castContext.addEventListener(
+        cast.framework.CastContextEventType.SESSION_STATE_CHANGED,
+        function (e) {
+          if (e.sessionState === cast.framework.SessionState.SESSION_STARTED ||
+              e.sessionState === cast.framework.SessionState.SESSION_RESUMED) {
+            castLoad();
+          }
+        }
+      );
+    };
+
+    function isCasting() {
+      return castContext && castContext.getCurrentSession();
+    }
+
+    function castLoad() {
+      var session = isCasting();
+      if (!session) return;
+      // Use the host the page was opened from — the Chromecast can't reach localhost.
+      var url = window.location.origin + '/stream.m3u8?t=' + Date.now();
+      var info = new chrome.cast.media.MediaInfo(url, 'application/x-mpegurl');
+      info.streamType = chrome.cast.media.StreamType.LIVE;
+      session.loadMedia(new chrome.cast.media.LoadRequest(info)).then(
+        function () { setStatus('Casting to ' + session.getCastDevice().friendlyName); },
+        function (err) { setStatus('Cast failed: ' + JSON.stringify(err)); }
+      );
+    }
+    // -------------------------------------------------------------------------
 
     function start() {
       var src = '/stream.m3u8?t=' + Date.now();
@@ -231,9 +283,13 @@ static string IndexPage(string? current) => $$"""
         .then(function (r) {
           if (!r.ok) return r.text().then(function (t) { throw new Error(t || ('HTTP ' + r.status)); });
           start();
+          if (isCasting()) castLoad();   // push the new stream to an active cast too
         })
         .catch(function (e) { setStatus('Failed: ' + e.message); });
     }
+
+    // If the Cast SDK was already ready before this script ran, init now.
+    window.initCast();
 
     // Auto-start if a URL was pre-loaded at server startup.
     if (document.getElementById('url').value.trim()) start();
