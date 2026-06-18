@@ -31,7 +31,13 @@ const PERIODIC_HOURS   = +(process.env.RESOLVE_PERIODIC_HOURS   || 4);
 const MIN_INTERVAL_SEC = +(process.env.RESOLVE_MIN_INTERVAL_SEC || 120);
 const NAV_TIMEOUT_MS   = +(process.env.RESOLVE_NAV_TIMEOUT_MS   || 45000);
 const DEBUG_DIR        = process.env.DEBUG_DIR || '/tmp/resolver-debug';
-const SOURCE_HOST = (() => { try { return new URL(SOURCE_PAGE).host; } catch { return ''; } })();
+const SOURCE_REFERER   = process.env.SOURCE_REFERER || 'https://rdslive.org/';
+// Ad / tracker / redirect networks to block so they can't hijack the page
+// (popunders, top-frame redirects like the keto landing page). The player's own
+// domains (rdslive.org, canale-tv.net, *.cfd) are NOT here, so the player loads.
+const AD_HOST_RE = new RegExp(process.env.AD_HOSTS_RE ||
+  'ketogo|doubleclick|googlesyndication|googleadservices|googletagservices|google-analytics|googletagmanager|adservice|adnxs|taboola|outbrain|popads|popcash|propeller|onclick|onclck|exoclick|adsterra|hilltopads|juicyads|clickadu|monetag|bidvertiser|ad-?maven|pushwhy|histats|amung\\.us|yandex|quantserve|scorecardresearch|moatads|criteo|smartadserver|adskeeper|mgid|revcontent',
+  'i');
 // What a playlist request looks like — disguised "...-got.htm" OR a real ".m3u8",
 // on any host (the provider rotates the whole domain).
 const CAPTURE_RE = new RegExp(process.env.RESOLVE_PATTERN || '(-got\\.htm|\\.m3u8)');
@@ -45,22 +51,27 @@ let lastResolveAt = 0;
 
 async function tryPlay(page) {
   const sels = [
-    'button[aria-label*="play" i]', '.vjs-big-play-button', '.jw-icon-display',
-    '.plyr__control--overlaid', '#player', '.play-button', '.play', 'video',
+    '.jw-icon-display', '.jwplayer', '.vjs-big-play-button', '.video-js',
+    'button[aria-label*="play" i]', '.plyr__control--overlaid', '.play-button', '.play', '#player', 'video',
   ];
   for (const f of page.frames()) {
-    for (const sel of sels) { try { await f.click(sel, { timeout: 400 }); } catch {} }
-    try { await f.click('body', { position: { x: 240, y: 160 }, timeout: 400 }); } catch {}
+    // Directly start any <video> (muted, to satisfy autoplay) and click play UIs.
+    try { await f.evaluate(() => { const v = document.querySelector('video'); if (v) { v.muted = true; const p = v.play && v.play(); if (p && p.catch) p.catch(() => {}); } }); } catch {}
+    for (const sel of sels) { try { await f.click(sel, { timeout: 300 }); } catch {} }
+    for (const pos of [{ x: 240, y: 160 }, { x: 480, y: 270 }, { x: 640, y: 360 }]) {
+      try { await f.click('body', { position: pos, timeout: 300 }); } catch {}
+    }
   }
 }
 
-async function dumpDiagnostics(page, candidates) {
+async function dumpDiagnostics(page, candidates, hosts) {
   let title = '', url = '';
   try { title = await page.title(); } catch {}
   try { url = page.url(); } catch {}
   const frames = page.frames().map((f) => f.url()).filter((u) => u && u !== 'about:blank');
   log('DIAG title =', JSON.stringify(title), '| final url =', url);
   log('DIAG frames:', frames.slice(0, 12).join('  |  ') || '(none)');
+  log('DIAG all hosts contacted:', [...hosts].sort().join(', ') || '(none)');
   log('DIAG candidate requests seen (' + candidates.length + '):');
   candidates.slice(0, 40).forEach((u) => log('   .', u));
   try {
@@ -75,16 +86,26 @@ async function dumpDiagnostics(page, candidates) {
 async function captureUrl() {
   const browser = await chromium.launch({
     headless: true,
-    args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled'],
+    args: [
+      '--no-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled',
+      '--autoplay-policy=no-user-gesture-required', // let the player auto-start so it fetches the stream
+    ],
   });
   try {
     const ctx = await browser.newContext({ userAgent: UA, viewport: { width: 1280, height: 720 } });
 
+    // Neutralize popunders/redirect helpers before any page script runs.
+    await ctx.addInitScript(() => {
+      try { window.open = () => null; } catch (e) {}
+    });
+
     let captured = null;
     const seen = new Set();
     const candidates = [];
+    const hosts = new Set();
     ctx.on('request', (req) => {
       const u = req.url();
+      try { hosts.add(new URL(u).host); } catch {}
       if (!captured && CAPTURE_RE.test(u)) captured = u;
       if (CANDIDATE_RE.test(u) && !seen.has(u)) { seen.add(u); candidates.push(u); }
     });
@@ -93,37 +114,26 @@ async function captureUrl() {
     await page.route('**/*', (route) => {
       const req = route.request();
       const t = req.resourceType();
+      let host = '';
+      try { host = new URL(req.url()).host; } catch {}
+      // Drop heavy noise and ALL ad/redirect networks (so they can't hijack the tab).
       if (t === 'image' || t === 'font') return route.abort();
-      // Block ad-driven attempts to navigate the MAIN frame off the source site
-      // (popunder/redirect hijacks — e.g. the keto landing page). Sub-frames (the
-      // player iframe, canale-tv, the .cfd stream) are allowed through.
-      if (req.isNavigationRequest() && req.frame() === page.mainFrame()) {
-        let h = '';
-        try { h = new URL(req.url()).host; } catch {}
-        if (h && SOURCE_HOST && h !== SOURCE_HOST) {
-          log('blocked main-frame redirect ->', h);
-          return route.abort();
-        }
-      }
+      if (AD_HOST_RE.test(host)) return route.abort();
       return route.continue();
     });
-    // Auto-dismiss any popup windows ads open (they don't hijack the main page,
-    // but close them to keep things clean).
-    ctx.on('page', (p) => { if (p !== page) p.close().catch(() => {}); });
+    // Load with the antena-1 referer (the player page may expect it).
+    await page.goto(SOURCE_PAGE, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS, referer: SOURCE_REFERER }).catch(() => {});
 
-    await page.goto(SOURCE_PAGE, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS }).catch(() => {});
-
+    // Poke the player to start (it won't fetch the stream until it begins playing).
+    // Repeat every few seconds — the player iframe may still be loading at first.
     const deadline = Date.now() + NAV_TIMEOUT_MS;
-    let clicked = false;
+    let lastClick = 0;
     while (!captured && Date.now() < deadline) {
       await page.waitForTimeout(700);
-      if (!captured && !clicked && Date.now() > deadline - NAV_TIMEOUT_MS + 5000) {
-        clicked = true;
-        await tryPlay(page);
-      }
+      if (!captured && Date.now() - lastClick > 3500) { lastClick = Date.now(); await tryPlay(page); }
     }
 
-    if (!captured) await dumpDiagnostics(page, candidates);
+    if (!captured) await dumpDiagnostics(page, candidates, hosts);
     return captured;
   } finally {
     await browser.close().catch(() => {});
