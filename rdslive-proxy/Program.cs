@@ -750,6 +750,8 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
     <div class="grp ctl">
       <button id="btnLive" class="alt" onclick="goLive()" title="Live edge">Live</button>
       <button id="btnDvr" class="alt" onclick="goDvr()" title="Timeshift / DVR — scrub back through the recorded window">DVR</button>
+      <button class="alt" onclick="skip(-10)" title="Back 10 seconds">&#9194;10</button>
+      <button class="alt" onclick="skip(10)" title="Forward 10 seconds">10&#9193;</button>
       <a class="dl" href="/dvr/export.ts" title="Download the recorded buffer as one .ts file">&#8595; .ts</a>
       <button class="danger" onclick="wipeDvr()" title="Permanently delete ALL recordings">Wipe</button>
       <google-cast-launcher id="castbtn" title="Cast to a Chromecast (open this page via your LAN IP, not localhost)"></google-cast-launcher>
@@ -855,6 +857,19 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
     function start()  { play('/stream.m3u8'); }
     function goLive() { play('/stream.m3u8'); if (isCasting()) castLoad(); }
     function goDvr()  { play('/dvr.m3u8');    if (isCasting()) castLoad(); }
+
+    // Skip ±N seconds, clamped to the buffer's seekable range.
+    function skip(delta) {
+      var t = v.currentTime + delta;
+      try {
+        if (v.seekable && v.seekable.length) {
+          var s = v.seekable.start(0), e = v.seekable.end(v.seekable.length - 1);
+          t = Math.min(Math.max(t, s), e);
+        } else { t = Math.max(0, t); }
+      } catch (err) { t = Math.max(0, t); }
+      v.currentTime = t;
+      if (v.paused) v.play();
+    }
 
     function load() {
       var url = document.getElementById('url').value.trim();
