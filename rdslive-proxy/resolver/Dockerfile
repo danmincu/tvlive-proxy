@@ -9,4 +9,6 @@ COPY index.js ./
 
 # Run as the image's non-root 'pwuser'.
 USER pwuser
-CMD ["node", "index.js"]
+# Run under a virtual display so Chromium can run HEADED (not headless) — protected
+# players (disable-devtool / Clappr) detect and block headless. xvfb ships in the image.
+CMD ["xvfb-run", "--auto-servernum", "--server-args=-screen 0 1280x720x24", "node", "index.js"]

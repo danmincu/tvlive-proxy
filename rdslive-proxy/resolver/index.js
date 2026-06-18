@@ -38,6 +38,9 @@ const SOURCE_REFERER   = process.env.SOURCE_REFERER || 'https://rdslive.org/';
 // retrying instead.
 const BLOCK_ADS = /^(1|true|yes)$/i.test(process.env.BLOCK_ADS || '');
 const ATTEMPTS  = Math.max(1, +(process.env.RESOLVE_ATTEMPTS || 3));
+// Headed by default (run under xvfb): protected players detect headless and refuse
+// to build the stream URL. Set HEADLESS=1 to force headless (faster, but blocked here).
+const HEADLESS  = /^(1|true|yes)$/i.test(process.env.HEADLESS || '');
 const AD_HOST_RE = new RegExp(process.env.AD_HOSTS_RE ||
   'ketogo|doubleclick|googlesyndication|googleadservices|googletagservices|google-analytics|googletagmanager|adservice|adnxs|taboola|outbrain|popads|popcash|propeller|onclick|onclck|exoclick|adsterra|hilltopads|juicyads|clickadu|monetag|bidvertiser|ad-?maven|pushwhy|histats|amung\\.us|yandex|quantserve|scorecardresearch|moatads|criteo|smartadserver|adskeeper|mgid|revcontent',
   'i');
@@ -54,8 +57,9 @@ let lastResolveAt = 0;
 
 async function tryPlay(page) {
   const sels = [
+    '#click-to-play', '#player', '.play-wrapper', '[data-player]', '.clappr-style',  // this player (Clappr)
     '.jw-icon-display', '.jwplayer', '.vjs-big-play-button', '.video-js',
-    'button[aria-label*="play" i]', '.plyr__control--overlaid', '.play-button', '.play', '#player', 'video',
+    'button[aria-label*="play" i]', '.plyr__control--overlaid', '.play-button', '.play', 'video',
   ];
   for (const f of page.frames()) {
     // Directly start any <video> (muted, to satisfy autoplay) and click play UIs.
@@ -125,7 +129,7 @@ async function dumpDiagnostics(page, candidates, hosts) {
 
 async function captureUrl() {
   const browser = await chromium.launch({
-    headless: true,
+    headless: HEADLESS,
     args: [
       '--no-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled',
       '--autoplay-policy=no-user-gesture-required', // let the player auto-start so it fetches the stream
