@@ -42,6 +42,14 @@ int httpsPort = int.TryParse(Environment.GetEnvironmentVariable("PROXY_HTTPS_POR
 // set to e.g. "192.168.1.54" when reaching the player via a DDNS/public hostname.
 string castHost = Environment.GetEnvironmentVariable("PROXY_CAST_HOST") ?? "";
 
+// Resilience: how long to wait for an upstream response before giving up on an
+// attempt, and how many extra attempts to make on transient failures. These guard
+// the *connect + headers* phase; once bytes are streaming we can't retry. Tuned
+// short because this is a live stream — the player (hls.js) also retries itself.
+TimeSpan upstreamTimeout = TimeSpan.FromSeconds(
+    int.TryParse(Environment.GetEnvironmentVariable("PROXY_TIMEOUT_SECONDS"), out var ts) ? ts : 15);
+int maxAttempts = 1 + (int.TryParse(Environment.GetEnvironmentVariable("PROXY_RETRIES"), out var rt) ? Math.Max(0, rt) : 2);
+
 // The currently-selected upstream stream. Mutated when the user submits the
 // form (POST /set), or pre-loaded from the CLI arg / env var below.
 var state = new StreamState();
@@ -76,7 +84,12 @@ builder.Services.AddSingleton(_ => new HttpClient(new HttpClientHandler
 {
     AutomaticDecompression = DecompressionMethods.All,
     AllowAutoRedirect = true,
-}));
+})
+{
+    // We manage timeouts per-attempt via a CancellationToken (see SendUpstreamAsync),
+    // so disable the global 100s timeout that would otherwise also cap body streaming.
+    Timeout = Timeout.InfiniteTimeSpan,
+});
 
 // The Chromecast default receiver fetches the manifest/segments via XHR and
 // requires CORS headers (a same-origin browser does not). Allow everything.
@@ -119,6 +132,53 @@ void AddBrowserHeaders(HttpRequestMessage req)
     req.Headers.TryAddWithoutValidation("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36");
 }
 
+// Send an upstream GET (headers only) with a per-attempt timeout and bounded
+// retry+backoff on transient failures: our timeout, connection errors, and
+// 5xx/408/429 responses. NOT retried: the client going away, or definitive
+// statuses like 403/404. Retries always happen before we stream any bytes to the
+// client, so they're safe. Returns the response (which may carry an error status)
+// or null if every attempt failed to get a response at all.
+async Task<HttpResponseMessage?> SendUpstreamAsync(HttpClient http, string url, string label, CancellationToken ct)
+{
+    static bool IsTransient(HttpStatusCode s) =>
+        (int)s >= 500 || s == HttpStatusCode.RequestTimeout || s == HttpStatusCode.TooManyRequests;
+
+    for (int attempt = 1; ; attempt++)
+    {
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeoutCts.CancelAfter(upstreamTimeout);
+        var req = new HttpRequestMessage(HttpMethod.Get, url);
+        AddBrowserHeaders(req);
+
+        try
+        {
+            var resp = await http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, timeoutCts.Token);
+            if (!IsTransient(resp.StatusCode) || attempt >= maxAttempts)
+                return resp;
+            log.LogWarning("{Label}: upstream {Status} (attempt {Attempt}/{Max}); retrying",
+                label, (int)resp.StatusCode, attempt, maxAttempts);
+            resp.Dispose();
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw; // the client disconnected — stop, let it bubble up
+        }
+        catch (Exception ex) when (ex is HttpRequestException or OperationCanceledException or IOException)
+        {
+            // our per-attempt timeout, or a connection-level error
+            if (attempt >= maxAttempts)
+            {
+                log.LogWarning("{Label}: failed after {Max} attempts ({Msg})", label, maxAttempts, ex.Message);
+                return null;
+            }
+            log.LogWarning("{Label}: {Msg} (attempt {Attempt}/{Max}); retrying", label, ex.Message, attempt, maxAttempts);
+        }
+
+        // Exponential backoff: 200ms, 400ms, 800ms, ...
+        await Task.Delay(TimeSpan.FromMilliseconds(200 * Math.Pow(2, attempt - 1)), ct);
+    }
+}
+
 // The web UI: a URL box + an HLS video player.
 app.MapGet("/", (HttpResponse response) =>
 {
@@ -156,10 +216,13 @@ app.MapGet("/stream.m3u8", async (HttpResponse response, HttpClient http, Cancel
 
     log.LogInformation("Playlist  -> {Url}", playlistUrl);
 
-    using var req = new HttpRequestMessage(HttpMethod.Get, playlistUrl);
-    AddBrowserHeaders(req);
-
-    using var upstream = await http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
+    using var upstream = await SendUpstreamAsync(http, playlistUrl, "Playlist", ct);
+    if (upstream is null)
+    {
+        response.StatusCode = StatusCodes.Status502BadGateway;
+        await response.WriteAsync("Upstream playlist unreachable after retries.", ct);
+        return;
+    }
     if (!upstream.IsSuccessStatusCode)
     {
         log.LogWarning("Playlist upstream returned {Status}", (int)upstream.StatusCode);
@@ -188,10 +251,12 @@ app.MapGet("/{*path}", async (string path, HttpResponse response, HttpClient htt
     string target = baseUrl + path;
     log.LogInformation("Segment   -> {Url}", target);
 
-    using var req = new HttpRequestMessage(HttpMethod.Get, target);
-    AddBrowserHeaders(req);
-
-    using var upstream = await http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
+    using var upstream = await SendUpstreamAsync(http, target, "Segment " + path, ct);
+    if (upstream is null)
+    {
+        response.StatusCode = StatusCodes.Status502BadGateway;
+        return;
+    }
     response.StatusCode = (int)upstream.StatusCode;
 
     // The origin serves MPEG-TS segments disguised as .html with Content-Type
@@ -213,8 +278,17 @@ app.MapGet("/{*path}", async (string path, HttpResponse response, HttpClient htt
         return;
     }
 
-    // Stream the bytes straight through to the player.
-    await upstream.Content.CopyToAsync(response.Body, ct);
+    // Stream the bytes straight through to the player. If the upstream connection
+    // breaks mid-segment we can't retry (bytes are already flowing) — just log it;
+    // the player's own retry will re-request the fragment.
+    try
+    {
+        await upstream.Content.CopyToAsync(response.Body, ct);
+    }
+    catch (Exception ex) when (ex is IOException or OperationCanceledException && !ct.IsCancellationRequested)
+    {
+        log.LogWarning("Segment stream interrupted for {Path}: {Msg}", path, ex.Message);
+    }
 });
 
 log.LogInformation("rdslive-proxy listening (bind {Bind})", bind);

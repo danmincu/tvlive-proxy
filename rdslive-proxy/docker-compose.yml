@@ -16,3 +16,7 @@ services:
       # player is opened via a DDNS/public hostname. run.sh auto-detects and exports
       # this; empty falls back to the browser's hostname. Override: PROXY_CAST_HOST=<ip> ./run.sh
       PROXY_CAST_HOST: "${PROXY_CAST_HOST:-}"
+      # Upstream resilience (optional): per-attempt timeout and extra retries on
+      # transient failures (timeouts, connection errors, 5xx/408/429).
+      # PROXY_TIMEOUT_SECONDS: "15"
+      # PROXY_RETRIES: "2"
