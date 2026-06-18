@@ -831,15 +831,18 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
     // DVR timeshift playlist ('/dvr.m3u8'). Cast and reload follow this.
     var currentPath = '/stream.m3u8';
 
-    function play(path) {
+    function play(path, startPos) {
       currentPath = path;
       var live = path.indexOf('/dvr.m3u8') < 0;
+      var seekTo = (!live && typeof startPos === 'number' && startPos > 0) ? startPos : -1;
       document.getElementById('btnLive').classList.toggle('active', live);
       document.getElementById('btnDvr').classList.toggle('active', !live);
       var src = path + (path.indexOf('?') >= 0 ? '&' : '?') + 't=' + Date.now();
       if (window.Hls && Hls.isSupported()) {
         if (hls) hls.destroy();
-        hls = new Hls({ liveSyncDuration: 12 });
+        var cfg = { liveSyncDuration: 12 };
+        if (seekTo > 0) cfg.startPosition = seekTo;   // open DVR at the resume/live-edge point
+        hls = new Hls(cfg);
         hls.loadSource(src);
         hls.attachMedia(v);
         hls.on(Hls.Events.MANIFEST_PARSED, function () { v.play(); setStatus(live ? 'Playing (live)' : 'Playing (DVR — seek anywhere; re-click DVR for newer)'); });
@@ -849,19 +852,46 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
       } else {
         // Safari / native HLS
         v.src = src;
+        if (seekTo > 0) {
+          v.addEventListener('loadedmetadata', function once() { v.removeEventListener('loadedmetadata', once); try { v.currentTime = seekTo; } catch (e) {} });
+        }
         v.play();
-        setStatus('Playing (native HLS)');
+        setStatus(live ? 'Playing (native HLS)' : 'Playing (DVR, native)');
       }
     }
 
     function isDvr() { return currentPath.indexOf('/dvr.m3u8') >= 0; }
 
+    // For resume: remember the wallclock instant we're watching in the DVR (not a raw
+    // offset, which shifts as old segments are pruned). Keyed per stream URL per browser.
+    var dvrFromMs = 0;
+    function dvrKey() { return 'dvrResume:' + ((document.getElementById('url').value || '').trim() || 'default'); }
+
+    function saveDvrPos() {
+      if (!isDvr() || !dvrFromMs) return;
+      try { localStorage.setItem(dvrKey(), String(Math.round(dvrFromMs + v.currentTime * 1000))); } catch (e) {}
+    }
+
     function start()  { play('/stream.m3u8'); }
     function goLive() { play('/stream.m3u8'); if (isCasting()) castLoad(); }
+
     // Load DVR as VOD (ENDLIST) so it's a fixed, fully-seekable recording — hls.js
-    // won't reload it or snap back to the live edge. Re-click DVR to pull in newer
-    // recordings (the VOD is a snapshot up to the moment you opened it).
-    function goDvr()  { play('/dvr.m3u8?vod=1'); if (isCasting()) castLoad(); }
+    // won't reload it or snap to the live edge. Open at the saved spot for this browser,
+    // else at the live edge (most recent). Re-click DVR to pull in newer recordings.
+    function goDvr() {
+      fetch('/dvr/status').then(function (r) { return r.json(); }).then(function (s) {
+        var start = -1;
+        if (s.fromUtc && s.toUtc) {
+          var from = Date.parse(s.fromUtc), to = Date.parse(s.toUtc);
+          dvrFromMs = from;
+          var saved = parseFloat(localStorage.getItem(dvrKey()) || '');
+          var targetMs = (saved && saved > from + 1000 && saved < to - 1000) ? saved : (to - 15000);
+          start = Math.max(0, (targetMs - from) / 1000);
+        }
+        play('/dvr.m3u8?vod=1', start);
+        if (isCasting()) castLoad();
+      }).catch(function () { play('/dvr.m3u8?vod=1', -1); });
+    }
 
     // Skip ±N seconds, clamped to the buffer's seekable range.
     function skip(delta) {
@@ -949,6 +979,11 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
         lastHealthOk = (h.ok !== false);
       }).catch(function () {});
     }
+
+    // Persist the DVR watch position (per browser) so re-opening DVR resumes there.
+    setInterval(saveDvrPos, 5000);
+    v.addEventListener('pause', saveDvrPos);
+    window.addEventListener('pagehide', saveDvrPos);
 
     // If the Cast SDK was already ready before this script ran, init now.
     window.initCast();
