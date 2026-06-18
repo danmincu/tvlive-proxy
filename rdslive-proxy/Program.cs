@@ -1,4 +1,6 @@
 using System.Net;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 
 // ---------------------------------------------------------------------------
 // rdslive-proxy
@@ -30,6 +32,11 @@ using System.Net;
 string origin = Environment.GetEnvironmentVariable("PROXY_ORIGIN") ?? "https://canale-tv.net";
 string referer = Environment.GetEnvironmentVariable("PROXY_REFERER") ?? "https://canale-tv.net/";
 int port = int.TryParse(Environment.GetEnvironmentVariable("PROXY_PORT"), out var p) ? p : 13001;
+// HTTPS port: needed because Chrome's Cast SDK only initializes in a *secure
+// context* (https:// or localhost). A plain-http LAN IP is not secure, so the
+// cast button never appears. We serve both: http for media/VLC/Chromecast, and
+// https (self-signed) for the player page so the cast button works.
+int httpsPort = int.TryParse(Environment.GetEnvironmentVariable("PROXY_HTTPS_PORT"), out var hp) ? hp : 13443;
 
 // The currently-selected upstream stream. Mutated when the user submits the
 // form (POST /set), or pre-loaded from the CLI arg / env var below.
@@ -40,8 +47,25 @@ string initialUrl =
     ?? "https://alpha1.yosefina1.cfd/ah1/usergenx304Jtlrnd2-got.htm";
 state.Set(initialUrl);
 
+// Bind address: 0.0.0.0 so it's reachable on the LAN (required for casting and
+// for the container). Override with PROXY_BIND (e.g. "127.0.0.1").
+string bind = Environment.GetEnvironmentVariable("PROXY_BIND") ?? "0.0.0.0";
+IPAddress bindAddr = IPAddress.Parse(bind);
+
 var builder = WebApplication.CreateBuilder(args);
 builder.Logging.AddSimpleConsole(o => o.SingleLine = true);
+
+// Generate a self-signed cert in-process (no cert files needed in the image).
+// The browser will warn once; clicking through still yields a secure context,
+// which is all the Cast SDK needs. Chromecast itself never sees this cert — we
+// point its media fetch at the plain-http endpoint (see the cast code).
+var cert = BuildSelfSignedCert();
+
+builder.WebHost.ConfigureKestrel(options =>
+{
+    options.Listen(bindAddr, port);                                  // http  — media, VLC, Chromecast
+    options.Listen(bindAddr, httpsPort, lo => lo.UseHttps(cert));    // https — player page / cast button
+});
 
 // One shared HttpClient. Automatic decompression so we hand the player plain bytes.
 builder.Services.AddSingleton(_ => new HttpClient(new HttpClientHandler
@@ -52,6 +76,21 @@ builder.Services.AddSingleton(_ => new HttpClient(new HttpClientHandler
 
 var app = builder.Build();
 var log = app.Logger;
+
+// Build a throwaway self-signed cert for the https endpoint. Export+reimport as
+// PFX so Kestrel reliably gets the private key (notably on Windows).
+static X509Certificate2 BuildSelfSignedCert()
+{
+    using var rsa = RSA.Create(2048);
+    var req = new CertificateRequest("CN=rdslive-proxy", rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+    var san = new SubjectAlternativeNameBuilder();
+    san.AddDnsName("localhost");
+    req.CertificateExtensions.Add(san.Build());
+    req.CertificateExtensions.Add(new X509KeyUsageExtension(
+        X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyEncipherment, false));
+    using var ephemeral = req.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddYears(5));
+    return X509CertificateLoader.LoadPkcs12(ephemeral.Export(X509ContentType.Pfx), null, X509KeyStorageFlags.Exportable);
+}
 
 // Apply the exact browser headers from the curl examples to an upstream request.
 void AddBrowserHeaders(HttpRequestMessage req)
@@ -74,7 +113,7 @@ void AddBrowserHeaders(HttpRequestMessage req)
 app.MapGet("/", (HttpResponse response) =>
 {
     response.ContentType = "text/html; charset=utf-8";
-    return response.WriteAsync(IndexPage(state.PlaylistUrl));
+    return response.WriteAsync(IndexPage(state.PlaylistUrl, port));
 });
 
 // Set / change the active upstream URL. Body is the raw URL (text/plain).
@@ -155,22 +194,19 @@ app.MapGet("/{*path}", async (string path, HttpResponse response, HttpClient htt
     await upstream.Content.CopyToAsync(response.Body, ct);
 });
 
-// Bind to all interfaces so the port works both locally and inside a container.
-// Override with PROXY_BIND (e.g. "127.0.0.1" to restrict to localhost only).
-string bind = Environment.GetEnvironmentVariable("PROXY_BIND") ?? "0.0.0.0";
-
-log.LogInformation("rdslive-proxy listening on http://{Bind}:{Port}/", bind, port);
-log.LogInformation("Web player:    http://localhost:{Port}/", port);
-log.LogInformation("VLC / m3u8:    http://localhost:{Port}/stream.m3u8", port);
+log.LogInformation("rdslive-proxy listening (bind {Bind})", bind);
+log.LogInformation("Player (http):  http://localhost:{Port}/", port);
+log.LogInformation("Player (https): https://localhost:{HttpsPort}/   <- open via LAN IP for Chromecast", httpsPort);
+log.LogInformation("VLC / m3u8:     http://localhost:{Port}/stream.m3u8", port);
 if (state.PlaylistUrl is { } u)
-    log.LogInformation("Pre-loaded:    {Url}", u);
+    log.LogInformation("Pre-loaded:     {Url}", u);
 
-app.Run($"http://{bind}:{port}");
+app.Run();
 
 
 // The single-page player. hls.js drives playback in Chrome/Firefox; Safari
 // falls back to the browser's native HLS support.
-static string IndexPage(string? current) => $$"""
+static string IndexPage(string? current, int httpPort) => $$"""
 <!doctype html>
 <html>
 <head>
@@ -245,8 +281,10 @@ static string IndexPage(string? current) => $$"""
     function castLoad() {
       var session = isCasting();
       if (!session) return;
-      // Use the host the page was opened from — the Chromecast can't reach localhost.
-      var url = window.location.origin + '/stream.m3u8?t=' + Date.now();
+      // The Chromecast can't validate our self-signed cert, so always hand it the
+      // plain-http endpoint (same host, http port) regardless of how this page was opened.
+      var castBase = 'http://' + window.location.hostname + ':' + {{httpPort}};
+      var url = castBase + '/stream.m3u8?t=' + Date.now();
       var info = new chrome.cast.media.MediaInfo(url, 'application/x-mpegurl');
       info.streamType = chrome.cast.media.StreamType.LIVE;
       session.loadMedia(new chrome.cast.media.LoadRequest(info)).then(

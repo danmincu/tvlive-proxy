@@ -4,7 +4,8 @@ services:
     image: rdslive-proxy
     container_name: rdslive-proxy
     ports:
-      - "13001:13001"
+      - "13001:13001"   # http  — media, VLC, Chromecast
+      - "13443:13443"   # https — player page / Chromecast button
     restart: unless-stopped
     environment:
       # Pre-load a stream so it auto-plays for every visitor (optional):

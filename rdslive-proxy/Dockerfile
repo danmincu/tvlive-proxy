@@ -14,8 +14,9 @@ FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
 WORKDIR /app
 COPY --from=build /app ./
 
-# The app binds 0.0.0.0:13001 by default (see PROXY_BIND / PROXY_PORT).
+# The app binds 0.0.0.0 by default (see PROXY_BIND / PROXY_PORT / PROXY_HTTPS_PORT).
 ENV PROXY_PORT=13001
-EXPOSE 13001
+ENV PROXY_HTTPS_PORT=13443
+EXPOSE 13001 13443
 
 ENTRYPOINT ["dotnet", "rdslive-proxy.dll"]
