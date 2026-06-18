@@ -1,0 +1,13 @@
+services:
+  rdslive-proxy:
+    build: .
+    image: rdslive-proxy
+    container_name: rdslive-proxy
+    ports:
+      - "13001:13001"
+    restart: unless-stopped
+    environment:
+      # Pre-load a stream so it auto-plays for every visitor (optional):
+      # PROXY_PLAYLIST_URL: "https://alpha1.yosefina1.cfd/ah1/usergenx304Jtlrnd2-got.htm"
+      PROXY_ORIGIN: "https://canale-tv.net"
+      PROXY_REFERER: "https://canale-tv.net/"
