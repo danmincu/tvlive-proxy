@@ -1,6 +1,9 @@
+using System.Globalization;
 using System.Net;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
+using System.Text;
+using System.Text.RegularExpressions;
 
 // ---------------------------------------------------------------------------
 // rdslive-proxy
@@ -49,6 +52,17 @@ string castHost = Environment.GetEnvironmentVariable("PROXY_CAST_HOST") ?? "";
 TimeSpan upstreamTimeout = TimeSpan.FromSeconds(
     int.TryParse(Environment.GetEnvironmentVariable("PROXY_TIMEOUT_SECONDS"), out var ts) ? ts : 15);
 int maxAttempts = 1 + (int.TryParse(Environment.GetEnvironmentVariable("PROXY_RETRIES"), out var rt) ? Math.Max(0, rt) : 2);
+
+// DVR: continuously record the active stream to disk and keep a rolling window so
+// the player can seek back / export the last N hours as a single .ts. Recording
+// FOLLOWS the active /set stream — switching channels marks a discontinuity.
+bool dvrEnabled = (Environment.GetEnvironmentVariable("PROXY_DVR_ENABLED") ?? "true")
+    is "1" or "true" or "yes" or "TRUE";
+string dvrDir = Environment.GetEnvironmentVariable("PROXY_DVR_DIR") ?? "dvr";
+TimeSpan dvrRetention = TimeSpan.FromHours(
+    double.TryParse(Environment.GetEnvironmentVariable("PROXY_DVR_HOURS"), NumberStyles.Float, CultureInfo.InvariantCulture, out var dh) ? dh : 24);
+TimeSpan dvrPoll = TimeSpan.FromSeconds(
+    double.TryParse(Environment.GetEnvironmentVariable("PROXY_DVR_POLL_SECONDS"), NumberStyles.Float, CultureInfo.InvariantCulture, out var dp) ? dp : 4);
 
 // The currently-selected upstream stream. Mutated when the user submits the
 // form (POST /set), or pre-loaded from the CLI arg / env var below.
@@ -99,6 +113,12 @@ var app = builder.Build();
 var log = app.Logger;
 
 app.UseCors(p => p.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod());
+
+// The rolling DVR store (segment files + in-memory/​on-disk index). Loaded from
+// disk on startup so recordings survive restarts; old segments are pruned past
+// the retention window.
+var dvr = new DvrStore(dvrDir, dvrRetention, log);
+dvr.Load();
 
 // Build a throwaway self-signed cert for the https endpoint. Export+reimport as
 // PFX so Kestrel reliably gets the private key (notably on Windows).
@@ -179,6 +199,117 @@ async Task<HttpResponseMessage?> SendUpstreamAsync(HttpClient http, string url, 
     }
 }
 
+// Download one segment's bytes (with retries). Returns null on failure.
+async Task<byte[]?> DownloadSegmentAsync(HttpClient http, string url, CancellationToken ct)
+{
+    using var resp = await SendUpstreamAsync(http, url, "DVR segment", ct);
+    if (resp is null || !resp.IsSuccessStatusCode) return null;
+    return await resp.Content.ReadAsByteArrayAsync(ct);
+}
+
+// The recorder loop: poll the active playlist, store every new segment to disk,
+// prune past the retention window. Runs for the app's lifetime when DVR is on.
+async Task IngestLoopAsync(CancellationToken ct)
+{
+    var http = app.Services.GetRequiredService<HttpClient>();
+    string? channel = null;     // current upstream playlist URL we're recording
+    long lastSeq = -1;          // last upstream media-sequence number stored
+    bool pendingDisc = false;   // mark the next stored segment as a discontinuity
+    var lastPrune = DateTime.UtcNow;
+
+    log.LogInformation("DVR: recording enabled, dir='{Dir}', retention={Hours}h, poll={Poll}s",
+        dvr.Dir, dvrRetention.TotalHours, dvrPoll.TotalSeconds);
+
+    while (!ct.IsCancellationRequested)
+    {
+        try
+        {
+            var (playlistUrl, baseUrl) = state.Snapshot();
+            if (playlistUrl != channel)
+            {
+                channel = playlistUrl;
+                lastSeq = -1;
+                pendingDisc = true; // channel switch -> discontinuity in the recording
+                if (channel is not null) log.LogInformation("DVR: now recording {Url}", channel);
+            }
+            if (playlistUrl is null || baseUrl is null)
+            {
+                await Task.Delay(dvrPoll, ct);
+                continue;
+            }
+
+            using var resp = await SendUpstreamAsync(http, playlistUrl, "DVR playlist", ct);
+            if (resp is not null && resp.IsSuccessStatusCode)
+            {
+                var text = await resp.Content.ReadAsStringAsync(ct);
+                long mediaSeq = 0;
+                double pendingDur = 0;
+                bool extDisc = false;
+                int idx = 0;
+
+                foreach (var raw in text.Split('\n'))
+                {
+                    var line = raw.Trim();
+                    if (line.Length == 0) continue;
+                    if (line.StartsWith("#EXT-X-MEDIA-SEQUENCE:"))
+                    {
+                        long.TryParse(line.AsSpan(22).Trim(), out mediaSeq);
+                        continue;
+                    }
+                    if (line.StartsWith("#EXT-X-DISCONTINUITY-SEQUENCE")) continue;
+                    if (line == "#EXT-X-DISCONTINUITY") { extDisc = true; continue; }
+                    if (line.StartsWith("#EXTINF:"))
+                    {
+                        var v = line.AsSpan(8);
+                        int comma = v.IndexOf(',');
+                        if (comma >= 0) v = v[..comma];
+                        double.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out pendingDur);
+                        continue;
+                    }
+                    if (line.StartsWith('#')) continue;
+
+                    // A segment URI.
+                    long seq = mediaSeq + idx;
+                    idx++;
+                    if (seq <= lastSeq) { extDisc = false; pendingDur = 0; continue; }
+
+                    bool gap = lastSeq >= 0 && seq > lastSeq + 1; // we missed some -> discontinuity
+                    string segUrl = Uri.TryCreate(line, UriKind.Absolute, out var abs) ? abs.ToString() : baseUrl + line;
+
+                    var bytes = await DownloadSegmentAsync(http, segUrl, ct);
+                    if (bytes is null)
+                    {
+                        // Couldn't fetch it; skip but don't stall, and flag a hole.
+                        lastSeq = seq;
+                        pendingDisc = true;
+                        extDisc = false; pendingDur = 0;
+                        continue;
+                    }
+
+                    long id = dvr.Reserve();
+                    await File.WriteAllBytesAsync(dvr.PathFor(id), bytes, ct);
+                    dvr.Add(new DvrSeg(id, pendingDur > 0 ? pendingDur : 6.0, DateTime.UtcNow,
+                        pendingDisc || extDisc || gap, bytes.LongLength));
+
+                    lastSeq = seq;
+                    pendingDisc = false; extDisc = false; pendingDur = 0;
+                }
+            }
+
+            if (DateTime.UtcNow - lastPrune > TimeSpan.FromSeconds(60))
+            {
+                int removed = dvr.PruneExpired(DateTime.UtcNow);
+                if (removed > 0) log.LogInformation("DVR: pruned {N} expired segments", removed);
+                lastPrune = DateTime.UtcNow;
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
+        catch (Exception ex) { log.LogWarning("DVR loop error: {Msg}", ex.Message); }
+
+        await Task.Delay(dvrPoll, ct);
+    }
+}
+
 // The web UI: a URL box + an HLS video player.
 app.MapGet("/", (HttpResponse response) =>
 {
@@ -238,6 +369,104 @@ app.MapGet("/stream.m3u8", async (HttpResponse response, HttpClient http, Cancel
     await response.WriteAsync(body, ct);
 });
 
+// ---- DVR -----------------------------------------------------------------
+// These explicit routes take precedence over the catch-all below.
+
+// DVR timeshift playlist: the whole retained window as a live playlist (no
+// ENDLIST), so the player's seek bar spans the buffer and can ride to the live
+// edge. ?hours=N bounds the window (smaller manifest); ?vod=1 closes it (ENDLIST).
+app.MapGet("/dvr.m3u8", (HttpResponse response, HttpRequest request) =>
+{
+    var segs = dvr.Snapshot();
+    if (double.TryParse(request.Query["hours"], NumberStyles.Float, CultureInfo.InvariantCulture, out var h) && h > 0)
+    {
+        var cutoff = DateTime.UtcNow - TimeSpan.FromHours(h);
+        segs = Array.FindAll(segs, s => s.Utc >= cutoff);
+    }
+    bool vod = request.Query["vod"] == "1";
+
+    var sb = new StringBuilder();
+    sb.Append("#EXTM3U\n#EXT-X-VERSION:6\n");
+    double maxDur = 6;
+    foreach (var s in segs) if (s.Dur > maxDur) maxDur = s.Dur;
+    sb.Append("#EXT-X-TARGETDURATION:").Append((int)Math.Ceiling(maxDur)).Append('\n');
+    sb.Append("#EXT-X-MEDIA-SEQUENCE:").Append(segs.Length > 0 ? segs[0].Id : 0).Append('\n');
+    if (vod) sb.Append("#EXT-X-PLAYLIST-TYPE:VOD\n");
+    foreach (var s in segs)
+    {
+        if (s.Disc) sb.Append("#EXT-X-DISCONTINUITY\n");
+        sb.Append("#EXTINF:").Append(s.Dur.ToString("0.000", CultureInfo.InvariantCulture)).Append(",\n");
+        sb.Append("/dvr/seg/").Append(s.Id.ToString("D12")).Append(".ts\n");
+    }
+    if (vod) sb.Append("#EXT-X-ENDLIST\n");
+
+    response.ContentType = "application/vnd.apple.mpegurl";
+    response.Headers.CacheControl = "no-cache, no-store";
+    return response.WriteAsync(sb.ToString());
+});
+
+// Serve a recorded segment from disk.
+app.MapGet("/dvr/seg/{name}", (string name) =>
+{
+    if (!Regex.IsMatch(name, @"^\d{1,15}\.ts$")) return Results.NotFound();   // guard path traversal
+    var path = dvr.PathForName(name);
+    return File.Exists(path)
+        ? Results.File(path, "video/mp2t", enableRangeProcessing: true)
+        : Results.NotFound();
+});
+
+// Export the recorded window as a single downloadable MPEG-TS (concatenated
+// segments). ?from=&to= are unix-ms bounds; omit for the whole buffer.
+app.MapGet("/dvr/export.ts", async (HttpResponse response, HttpRequest request, CancellationToken ct) =>
+{
+    var segs = dvr.Snapshot();
+    if (long.TryParse(request.Query["from"], out var fromMs))
+    {
+        var from = DateTimeOffset.FromUnixTimeMilliseconds(fromMs).UtcDateTime;
+        segs = Array.FindAll(segs, s => s.Utc >= from);
+    }
+    if (long.TryParse(request.Query["to"], out var toMs))
+    {
+        var to = DateTimeOffset.FromUnixTimeMilliseconds(toMs).UtcDateTime;
+        segs = Array.FindAll(segs, s => s.Utc <= to);
+    }
+
+    response.ContentType = "video/mp2t";
+    response.Headers["Content-Disposition"] = "attachment; filename=\"dvr.ts\"";
+    var buffer = new byte[64 * 1024];
+    foreach (var s in segs)
+    {
+        var path = dvr.PathFor(s.Id);
+        if (!File.Exists(path)) continue; // pruned mid-export — skip
+        try
+        {
+            await using var fs = File.OpenRead(path);
+            int n;
+            while ((n = await fs.ReadAsync(buffer, ct)) > 0)
+                await response.Body.WriteAsync(buffer.AsMemory(0, n), ct);
+        }
+        catch (Exception ex) when (ex is IOException or OperationCanceledException)
+        {
+            break; // client went away or read error — stop
+        }
+    }
+});
+
+// DVR buffer stats for the UI.
+app.MapGet("/dvr/status", () =>
+{
+    var (count, seconds, from, to, bytes) = dvr.Stats();
+    return Results.Json(new
+    {
+        enabled = dvrEnabled,
+        segments = count,
+        hours = Math.Round(seconds / 3600.0, 2),
+        fromUtc = from,
+        toUtc = to,
+        bytes,
+    });
+});
+
 // Call 2: every segment (or sub-playlist) the player requests by relative name.
 app.MapGet("/{*path}", async (string path, HttpResponse response, HttpClient http, CancellationToken ct) =>
 {
@@ -291,10 +520,16 @@ app.MapGet("/{*path}", async (string path, HttpResponse response, HttpClient htt
     }
 });
 
+// Start the DVR recorder for the app's lifetime (fire-and-forget; it stops when
+// ApplicationStopping fires).
+if (dvrEnabled)
+    _ = IngestLoopAsync(app.Lifetime.ApplicationStopping);
+
 log.LogInformation("rdslive-proxy listening (bind {Bind})", bind);
 log.LogInformation("Player (http):  http://localhost:{Port}/", port);
 log.LogInformation("Player (https): https://localhost:{HttpsPort}/   <- open via LAN IP for Chromecast", httpsPort);
 log.LogInformation("VLC / m3u8:     http://localhost:{Port}/stream.m3u8", port);
+log.LogInformation("DVR timeshift:  http://localhost:{Port}/dvr.m3u8   (recording {On})", port, dvrEnabled ? "ON" : "OFF");
 if (state.PlaylistUrl is { } u)
     log.LogInformation("Pre-loaded:     {Url}", u);
 
@@ -315,8 +550,11 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
   header { display:flex; gap:8px; padding:10px; background:#1b1b1b; border-bottom:1px solid #333; }
   input { flex:1; padding:8px; border:1px solid #444; border-radius:4px; background:#222; color:#eee; }
   button { padding:8px 16px; border:0; border-radius:4px; background:#2d7; color:#000; font-weight:600; cursor:pointer; }
+  button.alt { background:#345; color:#eee; }
+  button.active { outline:2px solid #2d7; }
+  a.dl { padding:8px 12px; border-radius:4px; background:#345; color:#eee; text-decoration:none; font-weight:600; white-space:nowrap; }
   google-cast-launcher { width:32px; height:32px; flex:0 0 auto; cursor:pointer; --connected-color:#2d7; --disconnected-color:#eee; }
-  video { width:100%; height:calc(100vh - 55px); background:#000; display:block; }
+  video { width:100%; height:calc(100vh - 80px); background:#000; display:block; }
   #status { padding:4px 10px; color:#999; font-size:12px; min-height:16px; }
 </style>
 </head>
@@ -326,6 +564,9 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
            value="{{System.Net.WebUtility.HtmlEncode(current ?? "")}}"
            onkeydown="if(event.key==='Enter')load()">
     <button onclick="load()">OK</button>
+    <button id="btnLive" class="alt" onclick="goLive()" title="Live edge">Live</button>
+    <button id="btnDvr" class="alt" onclick="goDvr()" title="Timeshift / DVR — scrub back through the recorded window">DVR</button>
+    <a class="dl" href="/dvr/export.ts" title="Download the recorded buffer as one .ts file">&#8595; .ts</a>
     <google-cast-launcher id="castbtn" title="Cast to a Chromecast (open this page via your LAN IP, not localhost)"></google-cast-launcher>
   </header>
   <div id="status"></div>
@@ -383,7 +624,8 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
       // Chromecast is local; fall back to the browser's hostname (localhost case).
       var castHost = "{{castHost}}" || window.location.hostname;
       var castBase = 'http://' + castHost + ':' + {{httpPort}};
-      var url = castBase + '/stream.m3u8?t=' + Date.now();
+      // Cast whatever is currently playing (live or the DVR timeshift playlist).
+      var url = castBase + currentPath + (currentPath.indexOf('?') >= 0 ? '&' : '?') + 't=' + Date.now();
       var info = new chrome.cast.media.MediaInfo(url, 'application/x-mpegurl');
       info.streamType = chrome.cast.media.StreamType.LIVE;
       // The segments are MPEG-TS; tell the receiver so it doesn't have to guess.
@@ -396,14 +638,22 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
     }
     // -------------------------------------------------------------------------
 
-    function start() {
-      var src = '/stream.m3u8?t=' + Date.now();
+    // The source currently loaded into the player: live ('/stream.m3u8') or the
+    // DVR timeshift playlist ('/dvr.m3u8'). Cast and reload follow this.
+    var currentPath = '/stream.m3u8';
+
+    function play(path) {
+      currentPath = path;
+      var live = path.indexOf('/dvr.m3u8') < 0;
+      document.getElementById('btnLive').classList.toggle('active', live);
+      document.getElementById('btnDvr').classList.toggle('active', !live);
+      var src = path + (path.indexOf('?') >= 0 ? '&' : '?') + 't=' + Date.now();
       if (window.Hls && Hls.isSupported()) {
         if (hls) hls.destroy();
         hls = new Hls({ liveSyncDuration: 12 });
         hls.loadSource(src);
         hls.attachMedia(v);
-        hls.on(Hls.Events.MANIFEST_PARSED, function () { v.play(); setStatus('Playing'); });
+        hls.on(Hls.Events.MANIFEST_PARSED, function () { v.play(); setStatus(live ? 'Playing (live)' : 'Playing (DVR — drag the seek bar to rewind)'); });
         hls.on(Hls.Events.ERROR, function (e, d) {
           if (d.fatal) setStatus('Error: ' + d.type + ' / ' + d.details);
         });
@@ -414,6 +664,10 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
         setStatus('Playing (native HLS)');
       }
     }
+
+    function start()  { play('/stream.m3u8'); }
+    function goLive() { play('/stream.m3u8'); if (isCasting()) castLoad(); }
+    function goDvr()  { play('/dvr.m3u8');    if (isCasting()) castLoad(); }
 
     function load() {
       var url = document.getElementById('url').value.trim();
@@ -428,8 +682,19 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
         .catch(function (e) { setStatus('Failed: ' + e.message); });
     }
 
+    // Show how much is recorded, next to the DVR button.
+    function refreshDvr() {
+      fetch('/dvr/status').then(function (r) { return r.json(); }).then(function (s) {
+        var btn = document.getElementById('btnDvr');
+        if (!s.enabled) { btn.textContent = 'DVR off'; btn.disabled = true; return; }
+        btn.textContent = 'DVR ' + (s.hours || 0).toFixed(1) + 'h';
+      }).catch(function () {});
+    }
+
     // If the Cast SDK was already ready before this script ran, init now.
     window.initCast();
+    refreshDvr();
+    setInterval(refreshDvr, 15000);
 
     // Auto-start if a URL was pre-loaded at server startup.
     if (document.getElementById('url').value.trim()) start();
@@ -459,5 +724,142 @@ sealed class StreamState
     public (string? PlaylistUrl, string? BaseUrl) Snapshot()
     {
         lock (_gate) return (PlaylistUrl, BaseUrl);
+    }
+}
+
+
+// One recorded segment in the DVR index. Id is our own monotonic counter (the
+// upstream media-sequence resets across channels, so we don't reuse it). The
+// segment file on disk is "<Id:D12>.ts".
+sealed record DvrSeg(long Id, double Dur, DateTime Utc, bool Disc, long Size);
+
+// The rolling DVR buffer: segment files under <dir>/seg + an append-only index
+// file <dir>/index.log. The in-memory list is the source of truth at runtime;
+// the index is for surviving restarts. Single writer (the recorder); HTTP
+// handlers only take snapshots.
+sealed class DvrStore
+{
+    readonly object _gate = new();
+    readonly List<DvrSeg> _segs = new();
+    readonly string _segDir;
+    readonly string _indexPath;
+    readonly TimeSpan _retention;
+    readonly ILogger _log;
+    long _nextId = 1;
+
+    public string Dir { get; }
+
+    public DvrStore(string dir, TimeSpan retention, ILogger log)
+    {
+        Dir = Path.GetFullPath(dir);   // absolute — Results.File requires a rooted path
+        _segDir = Path.Combine(Dir, "seg");
+        _indexPath = Path.Combine(Dir, "index.log");
+        _retention = retention;
+        _log = log;
+        Directory.CreateDirectory(_segDir);
+    }
+
+    public string PathFor(long id) => Path.Combine(_segDir, id.ToString("D12") + ".ts");
+    public string PathForName(string name) => Path.Combine(_segDir, name);
+
+    public long Reserve() { lock (_gate) return _nextId++; }
+
+    public void Add(DvrSeg seg)
+    {
+        lock (_gate) _segs.Add(seg);
+        try { File.AppendAllText(_indexPath, Serialize(seg) + "\n"); }
+        catch (IOException ex) { _log.LogWarning("DVR: index append failed: {Msg}", ex.Message); }
+    }
+
+    public DvrSeg[] Snapshot() { lock (_gate) return _segs.ToArray(); }
+
+    public (int count, double seconds, DateTime? from, DateTime? to, long bytes) Stats()
+    {
+        lock (_gate)
+        {
+            if (_segs.Count == 0) return (0, 0, null, null, 0);
+            double secs = 0; long bytes = 0;
+            foreach (var s in _segs) { secs += s.Dur; bytes += s.Size; }
+            var last = _segs[^1];
+            return (_segs.Count, secs, _segs[0].Utc, last.Utc.AddSeconds(last.Dur), bytes);
+        }
+    }
+
+    // Drop (and delete) segments older than the retention window. Returns count removed.
+    public int PruneExpired(DateTime nowUtc)
+    {
+        var cutoff = nowUtc - _retention;
+        List<DvrSeg> removed = new();
+        lock (_gate)
+        {
+            while (_segs.Count > 0 && _segs[0].Utc < cutoff)
+            {
+                removed.Add(_segs[0]);
+                _segs.RemoveAt(0);
+            }
+            if (removed.Count > 0) RewriteIndexLocked();
+        }
+        foreach (var s in removed)
+            try { File.Delete(PathFor(s.Id)); } catch (IOException) { /* best effort */ }
+        return removed.Count;
+    }
+
+    // Load the index from disk on startup: parse, drop entries whose files are
+    // gone or expired (deleting expired files), resume the id counter, compact.
+    public void Load()
+    {
+        if (!File.Exists(_indexPath)) return;
+        var cutoff = DateTime.UtcNow - _retention;
+        long maxId = 0;
+        List<DvrSeg> toDelete = new();
+        try
+        {
+            foreach (var line in File.ReadLines(_indexPath))
+            {
+                if (Deserialize(line) is not { } s) continue;
+                if (s.Id > maxId) maxId = s.Id;
+                if (!File.Exists(PathFor(s.Id))) continue;          // file gone — drop entry
+                if (s.Utc < cutoff) { toDelete.Add(s); continue; }  // expired — delete file
+                _segs.Add(s);
+            }
+        }
+        catch (IOException ex) { _log.LogWarning("DVR: index load failed: {Msg}", ex.Message); }
+
+        _segs.Sort((a, b) => a.Id.CompareTo(b.Id));
+        _nextId = maxId + 1;
+        foreach (var s in toDelete)
+            try { File.Delete(PathFor(s.Id)); } catch (IOException) { }
+        lock (_gate) RewriteIndexLocked();   // compact away dropped/expired entries
+        _log.LogInformation("DVR: loaded {N} segments from disk", _segs.Count);
+    }
+
+    void RewriteIndexLocked()
+    {
+        var tmp = _indexPath + ".tmp";
+        try
+        {
+            File.WriteAllLines(tmp, _segs.ConvertAll(Serialize));
+            File.Move(tmp, _indexPath, overwrite: true);
+        }
+        catch (IOException ex) { _log.LogWarning("DVR: index rewrite failed: {Msg}", ex.Message); }
+    }
+
+    static string Serialize(DvrSeg s) =>
+        string.Join(';',
+            s.Id,
+            s.Dur.ToString(CultureInfo.InvariantCulture),
+            new DateTimeOffset(s.Utc, TimeSpan.Zero).ToUnixTimeMilliseconds(),
+            s.Disc ? 1 : 0,
+            s.Size);
+
+    static DvrSeg? Deserialize(string line)
+    {
+        var p = line.Split(';');
+        if (p.Length < 5) return null;
+        if (!long.TryParse(p[0], out var id)) return null;
+        if (!double.TryParse(p[1], NumberStyles.Float, CultureInfo.InvariantCulture, out var dur)) return null;
+        if (!long.TryParse(p[2], out var ms)) return null;
+        long.TryParse(p[4], out var size);
+        return new DvrSeg(id, dur, DateTimeOffset.FromUnixTimeMilliseconds(ms).UtcDateTime, p[3] == "1", size);
     }
 }

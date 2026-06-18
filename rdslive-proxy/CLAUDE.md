@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A single-project .NET 10 ASP.NET Core minimal-API app (`rdslive-proxy`) that acts as an HLS proxy **and** an inline web player. Its job is to let a browser or VLC play an HLS live stream whose origin requires specific browser headers (Origin/Referer/sec-* etc.) and serves segments under relative names. The entire app is `Program.cs` (~250 lines, top-level statements); there is no test project.
+A single-project .NET 10 ASP.NET Core minimal-API app (`rdslive-proxy`) that acts as an HLS proxy **and** an inline web player. Its job is to let a browser or VLC play an HLS live stream whose origin requires specific browser headers (Origin/Referer/sec-* etc.) and serves segments under relative names. It also Chromecasts the stream and runs a rolling **DVR** (records the active stream to disk for timeshift/seek and `.ts` export). The entire app is `Program.cs` (~700 lines, top-level statements); there is no test project.
 
 ## Commands
 
@@ -26,25 +26,36 @@ There are no tests or linters. Verify changes by running the app and hitting the
 
 ## Architecture
 
-Four routes in `Program.cs`, plus shared state:
+Routes in `Program.cs`, plus shared state (`StreamState`, `DvrStore` at the bottom of the file):
 
-- **`StreamState`** (bottom of file) — a single, process-global, lock-guarded holder for the *currently active* upstream playlist URL and its derived `BaseUrl` (everything up to the last `/`). There is **one** active stream shared by all visitors; whoever POSTs `/set` changes it for everyone. This is intentional (it's how a second visitor inherits the first visitor's URL).
-- **`GET /`** — serves the self-contained HTML player (`IndexPage`). The upstream URL input is pre-filled with the current `StreamState.PlaylistUrl`, and the page auto-starts playback if one is set.
+- **`StreamState`** — a single, process-global, lock-guarded holder for the *currently active* upstream playlist URL and its derived `BaseUrl` (everything up to the last `/`). There is **one** active stream shared by all visitors; whoever POSTs `/set` changes it for everyone. This is intentional (it's how a second visitor inherits the first visitor's URL).
+- **`GET /`** — serves the self-contained HTML player (`IndexPage`). URL input pre-filled with the current `StreamState.PlaylistUrl`; auto-starts if one is set. Has Live/DVR buttons, a Chromecast button, and a `.ts` download link.
 - **`POST /set`** — body is the raw URL; validates it's absolute http(s), then `StreamState.Set(url)`.
 - **`GET /stream.m3u8`** — Call 1: fetches the upstream playlist with the injected headers and returns it **verbatim** as `application/vnd.apple.mpegurl`.
-- **`GET /{*path}`** — Call 2: catch-all that proxies any other path to `BaseUrl + path`, streaming bytes straight through.
+- **`GET /{*path}`** — Call 2: catch-all that proxies any other path to `BaseUrl + path`, streaming bytes through. Rewrites `text/html` segment content-types to `video/mp2t` (the origin disguises MPEG-TS segments as `.html`) so the Chromecast receiver will demux them; hls.js doesn't care.
+- **DVR routes** — `GET /dvr.m3u8` (generated timeshift playlist from recorded segments; `?hours=N` bounds the window, `?vod=1` closes it with ENDLIST), `GET /dvr/seg/{id}.ts` (serve a recorded segment), `GET /dvr/export.ts` (concatenate the recorded window into one downloadable MPEG-TS; `?from=&to=` are unix-ms bounds), `GET /dvr/status` (buffer stats JSON).
 
 **The relative-URL mechanism is the crux:** the upstream playlist lists segments as bare relative names (e.g. `tokenizedXXXX.html`). Because the playlist is served from `/stream.m3u8`, the player resolves those names against `http://<host>:13001/`, so segment requests land on the `/{*path}` catch-all, which re-prepends the real upstream base. Do not rewrite segment URLs in the playlist — the verbatim pass-through is what makes this work for both browser and VLC.
 
-**Header injection:** `AddBrowserHeaders` applies the exact header set the origin expects to every upstream request (both calls). These come from the original `curl` capture; changing/removing them will likely break upstream fetches with 403s.
+**Header injection:** `AddBrowserHeaders` applies the exact header set the origin expects to every upstream request (all upstream fetches go through `SendUpstreamAsync`). These come from the original `curl` capture; changing/removing them will likely break upstream fetches with 403s.
 
-**Browser playback:** raw HLS doesn't play natively in Chrome/Firefox, so `IndexPage` loads **hls.js** from a CDN and falls back to native HLS on Safari.
+**Resilience:** `SendUpstreamAsync` wraps every upstream GET with a per-attempt timeout (`PROXY_TIMEOUT_SECONDS`) and bounded retry+backoff (`PROXY_RETRIES`) on transient failures (timeouts, connection errors, 5xx/408/429) — only before any bytes stream to the client. The shared `HttpClient` has an infinite global timeout because timeouts are managed per-attempt.
+
+**HTTPS + Chromecast:** Kestrel listens on http (`PROXY_PORT`, media/VLC/Chromecast) and https (`PROXY_HTTPS_PORT`, default 13443) with a runtime-generated self-signed cert. The Cast SDK only initializes in a secure context (https or localhost), so the player page must be opened via https for the cast button to appear. The Chromecast can't validate the self-signed cert, so the page hands it the **plain-http** media URL on the proxy's LAN IP (`PROXY_CAST_HOST`; `run.sh` auto-detects it) — the cast device fetches over the LAN directly, no router port-forward needed. CORS is enabled app-wide because the Cast receiver fetches via XHR.
+
+**DVR:** `IngestLoopAsync` (started for the app lifetime when `PROXY_DVR_ENABLED`) polls the active playlist every `PROXY_DVR_POLL_SECONDS`, downloads each new segment (tracked by upstream `EXT-X-MEDIA-SEQUENCE`) to `<PROXY_DVR_DIR>/seg/<id>.ts`, and appends to `DvrStore`. Recording **follows the active `/set` stream** — switching channels (or a restart/gap) marks an `EXT-X-DISCONTINUITY` on the next stored segment. `DvrStore` keeps an in-memory index (source of truth) plus an append-only `index.log` for restart recovery; a janitor prunes segments past `PROXY_DVR_HOURS`. Stored segment ids are our own monotonic counter (upstream sequence resets across channels). NOTE: recordings must live on a persistent volume in Docker (compose mounts `dvr-data:/app/dvr`).
+
+**Browser playback:** raw HLS doesn't play natively in Chrome/Firefox, so `IndexPage` loads **hls.js** from a CDN and falls back to native HLS on Safari. The player tracks `currentPath` (`/stream.m3u8` or `/dvr.m3u8`) so the cast button casts whatever is playing.
 
 ## Configuration (env vars, all optional)
 
 - `PROXY_PLAYLIST_URL` — initial/default upstream URL (CLI arg takes precedence; a hard-coded default exists in `Program.cs` if neither is set).
 - `PROXY_ORIGIN` / `PROXY_REFERER` — the Origin/Referer headers sent upstream.
 - `PROXY_PORT` (default 13001) and `PROXY_BIND` (default `0.0.0.0` — required for the container to be reachable; set `127.0.0.1` to restrict to localhost).
+- `PROXY_HTTPS_PORT` (default 13443) — https port (self-signed) for the player page / Chromecast.
+- `PROXY_CAST_HOST` — LAN IP the Chromecast should fetch media from (needed when opening the player via a DDNS/public hostname); `run.sh` auto-detects it. Empty → uses the browser's hostname.
+- `PROXY_TIMEOUT_SECONDS` (default 15), `PROXY_RETRIES` (default 2) — upstream resilience.
+- `PROXY_DVR_ENABLED` (default true), `PROXY_DVR_DIR` (default `dvr`), `PROXY_DVR_HOURS` (default 24), `PROXY_DVR_POLL_SECONDS` (default 4) — DVR recording.
 
 ## Conventions
 

@@ -20,3 +20,14 @@ services:
       # transient failures (timeouts, connection errors, 5xx/408/429).
       # PROXY_TIMEOUT_SECONDS: "15"
       # PROXY_RETRIES: "2"
+      # DVR: continuously record the active stream to disk for timeshift/seek and
+      # .ts export. Stored under /app/dvr (persisted via the volume below).
+      # Disk use ~= bitrate; e.g. 3 Mbps ~= 1.4 GB/h ~= 32 GB for 24h.
+      PROXY_DVR_ENABLED: "true"
+      PROXY_DVR_HOURS: "24"
+      # PROXY_DVR_POLL_SECONDS: "4"
+    volumes:
+      - dvr-data:/app/dvr   # recordings persist across container rebuilds
+
+volumes:
+  dvr-data:
