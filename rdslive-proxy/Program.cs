@@ -256,9 +256,12 @@ static string BuildDvrPlaylist(DvrSeg[] segs, bool endlist)
     sb.Append("#EXT-X-TARGETDURATION:").Append((int)Math.Ceiling(maxDur)).Append('\n');
     sb.Append("#EXT-X-MEDIA-SEQUENCE:").Append(segs.Length > 0 ? segs[0].Id : 0).Append('\n');
     if (endlist) sb.Append("#EXT-X-PLAYLIST-TYPE:VOD\n");
-    foreach (var s in segs)
+    for (int i = 0; i < segs.Length; i++)
     {
-        if (s.Disc) sb.Append("#EXT-X-DISCONTINUITY\n");
+        var s = segs[i];
+        // A discontinuity tag before the FIRST segment is meaningless and trips some
+        // players (notably the Chromecast receiver) — only emit it between segments.
+        if (s.Disc && i > 0) sb.Append("#EXT-X-DISCONTINUITY\n");
         sb.Append("#EXTINF:").Append(s.Dur.ToString("0.000", CultureInfo.InvariantCulture)).Append(",\n");
         sb.Append("/dvr/seg/").Append(s.Id.ToString("D12")).Append(".ts\n");
     }
@@ -764,8 +767,8 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
   button.danger { background:#a33; color:#fff; }
   a.dl { text-decoration:none; }
   button.active { outline:2px solid #2d7; outline-offset:-2px; }
-  google-cast-launcher { width:38px; height:38px; flex:0 0 auto; cursor:pointer; --connected-color:#2d7; --disconnected-color:#eee; }
-  #status { padding:4px 10px; color:#999; font-size:12px; min-height:16px; }
+  google-cast-launcher { width:40px; height:40px; flex:0 0 auto; align-self:center; padding:4px; box-sizing:border-box; background:#345; border-radius:6px; cursor:pointer; --connected-color:#2d7; --disconnected-color:#eee; }
+  #status { padding:4px 10px; color:#bbb; font-size:12px; min-height:16px; word-break:break-all; }
   #banner { display:none; padding:10px 12px; background:#5a1f1f; color:#ffd9d9; border-bottom:1px solid #803030; font-size:14px; }
   #banner.show { display:block; }
   video { flex:1 1 auto; width:100%; min-height:0; background:#000; display:block; }
@@ -775,6 +778,7 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
   @media (max-width:600px) {
     .grp.url, .grp.ctl { flex:1 1 100%; }
     .grp.ctl > button, .grp.ctl > a.dl { flex:1 1 auto; min-height:44px; }
+    google-cast-launcher { height:44px; width:52px; }
   }
 </style>
 </head>
@@ -832,9 +836,13 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
       castContext.addEventListener(
         cast.framework.CastContextEventType.SESSION_STATE_CHANGED,
         function (e) {
+          console.log('[cast] session state:', e.sessionState);
           if (e.sessionState === cast.framework.SessionState.SESSION_STARTED ||
               e.sessionState === cast.framework.SessionState.SESSION_RESUMED) {
             castLoad();
+          } else if (e.sessionState === cast.framework.SessionState.SESSION_START_FAILED) {
+            setStatus('Cast: session failed to start');
+            castFail('Cast session failed to start — check the Chromecast is on the same network.');
           }
         }
       );
@@ -846,23 +854,36 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
 
     function castLoad() {
       var session = isCasting();
-      if (!session) return;
+      if (!session) { setStatus('Cast: no active session'); return; }
       // The Chromecast can't validate our self-signed cert, so always hand it the
       // plain-http endpoint. Prefer the server's LAN IP (injected) since the
-      // Chromecast is local; fall back to the browser's hostname (localhost case).
+      // Chromecast is local; fall back to the browser's hostname.
       var castHost = "{{castHost}}" || window.location.hostname;
       var castBase = 'http://' + castHost + ':' + {{httpPort}};
       // Cast whatever is currently playing (live or the DVR timeshift playlist).
       var url = castBase + currentPath + (currentPath.indexOf('?') >= 0 ? '&' : '?') + 't=' + Date.now();
+      console.log('[cast] loading on device:', url);
+      setStatus('Casting… ' + url);
       var info = new chrome.cast.media.MediaInfo(url, 'application/x-mpegurl');
       info.streamType = chrome.cast.media.StreamType.LIVE;
       // The segments are MPEG-TS; tell the receiver so it doesn't have to guess.
       if (chrome.cast.media.HlsSegmentFormat) info.hlsSegmentFormat = chrome.cast.media.HlsSegmentFormat.TS;
       if (chrome.cast.media.HlsVideoSegmentFormat) info.hlsVideoSegmentFormat = chrome.cast.media.HlsVideoSegmentFormat.MPEG2_TS;
       session.loadMedia(new chrome.cast.media.LoadRequest(info)).then(
-        function () { setStatus('Casting to ' + session.getCastDevice().friendlyName); },
-        function (err) { setStatus('Cast failed: ' + JSON.stringify(err)); }
+        function () { setStatus('Casting to ' + session.getCastDevice().friendlyName); console.log('[cast] loadMedia OK'); },
+        function (err) {
+          var msg = (err && (err.description || err.code)) ? (err.description || err.code) : JSON.stringify(err);
+          console.log('[cast] loadMedia FAILED:', err, 'url=', url);
+          setStatus('Cast failed: ' + msg);
+          castFail('Cast failed (' + msg + '). The Chromecast must be able to reach ' + castBase +
+            ' on your network. If you opened this page via a public/DDNS address, set PROXY_CAST_HOST to the proxy’s LAN IP and rebuild.');
+        }
       );
+    }
+
+    function castFail(msg) {
+      var b = document.getElementById('banner');
+      if (b) { b.textContent = '⚠ ' + msg; b.className = 'show'; }
     }
     // -------------------------------------------------------------------------
 
