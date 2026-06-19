@@ -98,21 +98,42 @@ async function captureUrl() {
   }
 }
 
-async function verify(url) {
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Fetch a playlist with the upstream headers; return its text iff it's HLS, else null.
+async function fetchPlaylist(url) {
   try {
-    const r = await fetch(url, { headers: { accept: '*/*', origin: ORIGIN, referer: REFERER, 'user-agent': UA }, signal: AbortSignal.timeout(15000) });
-    if (!r.ok) return false;
-    const text = await r.text();
-    return text.replace(/^﻿/, '').trimStart().startsWith('#EXTM3U');
-  } catch { return false; }
+    const r = await fetch(url, { headers: { accept: '*/*', origin: ORIGIN, referer: REFERER, 'user-agent': UA }, signal: AbortSignal.timeout(8000) });
+    if (!r.ok) return null;
+    const t = await r.text();
+    return t.replace(/^﻿/, '').trimStart().startsWith('#EXTM3U') ? t : null;
+  } catch { return null; }
 }
 
-async function proxyGetCurrent() {
+async function verify(url) { return (await fetchPlaylist(url)) !== null; }
+
+// Is this URL serving a LIVE (advancing) playlist? Cheap HTTP probe — fetch twice and
+// confirm the media sequence advances, so we don't pick a host that's frozen/stalled.
+async function probeLive(url) {
+  const t1 = await fetchPlaylist(url);
+  if (!t1) return false;
+  const m1 = t1.match(/#EXT-X-MEDIA-SEQUENCE:(\d+)/);
+  if (!m1) return true; // valid playlist, can't measure -> accept
+  await sleep(3000);
+  const t2 = await fetchPlaylist(url);
+  if (!t2) return false;
+  const m2 = t2.match(/#EXT-X-MEDIA-SEQUENCE:(\d+)/);
+  return !!m2 && parseInt(m2[1], 10) > parseInt(m1[1], 10);
+}
+
+// {current, recent[]} from the proxy — recent is the persisted pool of known-good hosts.
+async function proxyGetState() {
   try {
     const r = await fetch(PROXY_BASE + '/admin/source', { headers: { 'X-Admin-Token': ADMIN_TOKEN } });
-    if (!r.ok) return null;
-    return (await r.json()).current || null;
-  } catch { return null; }
+    if (!r.ok) return { current: null, recent: [] };
+    const j = await r.json();
+    return { current: j.current || null, recent: Array.isArray(j.recent) ? j.recent : [] };
+  } catch { return { current: null, recent: [] }; }
 }
 
 async function proxyPush(url) {
@@ -135,11 +156,29 @@ async function resolve(reason) {
   lastResolveAt = Date.now();
   try {
     log('resolving...', reason);
+    const { current, recent } = await proxyGetState();
+
+    // 1) If the current source is still live, there's nothing to do (handles the
+    //    periodic check, and stalls that recovered on their own).
+    if (current && await probeLive(current)) { log('current source still live, nothing to do'); return; }
+
+    // 2) Try the known-good host pool first (same path/token, the provider just rotates
+    //    the host). A quick HTTP probe — no browser. First live one wins.
+    for (const u of recent) {
+      if (u === current) continue;
+      if (await probeLive(u)) {
+        log('cached host is live:', u);
+        log(await proxyPush(u) ? 'switched to cached host' : 'push FAILED');
+        return;
+      }
+    }
+
+    // 3) None of the known hosts work (token likely rotated) — full browser capture.
+    log('no cached host live; running browser capture');
     const url = await captureUrl();
     if (!url) { log('no playlist URL captured'); return; }
     log('captured:', url);
     if (!(await verify(url))) { log('verification failed (not an HLS playlist), ignoring'); return; }
-    const current = await proxyGetCurrent();
     if (current === url) { log('unchanged, nothing to do'); return; }
     log(await proxyPush(url) ? 'pushed new source to proxy' : 'push FAILED');
   } catch (e) {

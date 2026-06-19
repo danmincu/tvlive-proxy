@@ -87,9 +87,34 @@ string adminToken = Environment.GetEnvironmentVariable("PROXY_ADMIN_TOKEN") ?? "
 // The currently-selected upstream stream. Mutated when the user submits the
 // form (POST /set), or pre-loaded from the CLI arg / env var below.
 var state = new StreamState();
+
+// Persisted pool of recently-good source URLs (most-recent first), kept on the DVR
+// volume so they survive restarts. The newest is used to pre-load on startup instead
+// of the stale hard-coded default, and the resolver reads the whole list to probe
+// known hosts before doing a full browser capture.
+var recentSources = new List<string>();
+var recentGate = new object();
+string sourcesPath = Path.Combine(dvrDir, "sources.txt");
+try { if (File.Exists(sourcesPath)) recentSources.AddRange(File.ReadAllLines(sourcesPath).Select(l => l.Trim()).Where(l => l.Length > 0)); }
+catch (IOException) { }
+
+void RememberSource(string url)
+{
+    lock (recentGate)
+    {
+        recentSources.RemoveAll(u => u == url);
+        recentSources.Insert(0, url);
+        while (recentSources.Count > 8) recentSources.RemoveAt(recentSources.Count - 1);
+        try { Directory.CreateDirectory(dvrDir); File.WriteAllLines(sourcesPath, recentSources); }
+        catch (IOException) { }
+    }
+}
+string[] GetSources() { lock (recentGate) return recentSources.ToArray(); }
+
 string initialUrl =
     args.FirstOrDefault(a => !a.StartsWith('-'))
     ?? Environment.GetEnvironmentVariable("PROXY_PLAYLIST_URL")
+    ?? (recentSources.Count > 0 ? recentSources[0] : null)   // last known-good, survives restart
     ?? "https://alpha1.yosefina1.cfd/ah1/usergenx304Jtlrnd2-got.htm";
 state.Set(initialUrl);
 
@@ -444,6 +469,7 @@ app.MapPost("/set", async (HttpRequest request) =>
         return Results.BadRequest("Provide an absolute http(s) URL.");
 
     state.Set(url);
+    RememberSource(url);
     log.LogInformation("Active stream set (manual) -> {Url}", url);
     if (recorderWake.CurrentCount == 0) recorderWake.Release(); // wake the recorder now
     return Results.NoContent();
@@ -609,7 +635,7 @@ app.MapGet("/admin/source", (HttpRequest request) =>
     if (adminToken.Length == 0 || request.Headers["X-Admin-Token"].ToString() != adminToken)
         return Results.NotFound();
     var (url, _) = state.Snapshot();
-    return Results.Json(new { current = url });
+    return Results.Json(new { current = url, recent = GetSources() });
 });
 
 app.MapPost("/admin/source", async (HttpRequest request) =>
@@ -622,6 +648,7 @@ app.MapPost("/admin/source", async (HttpRequest request) =>
         return Results.BadRequest("Provide an absolute http(s) URL.");
 
     var (current, _) = state.Snapshot();
+    RememberSource(url); // remember even if unchanged, so it stays at the top of the pool
     if (current == url)
         return Results.Json(new { updated = false, current = url });
 

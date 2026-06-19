@@ -8,11 +8,15 @@ pasting URLs by hand.
 
 1. Polls the proxy's `GET /health`. When the stream is **stalled/down** (or on a periodic
    timer) it triggers a resolution.
-2. Launches **real Google Chrome** (`channel: 'chrome'`), loads `SOURCE_PAGE`, stubs
+2. **Probes the known-host pool first** (`recent` from `/admin/source`): the provider rotates
+   the host but keeps the same path/token, so a sibling host is usually already live. A cheap
+   HTTP probe (`probeLive` — fetches twice, confirms the media-sequence advances) picks a live
+   one and pushes it — no browser. Only if none are live does it fall to the full capture:
+3. Launches **real Google Chrome** (`channel: 'chrome'`), loads `SOURCE_PAGE`, stubs
    `window.open`, dismisses the vignette ad, peels ad overlays off the player and clicks it
    to start playback, and captures the stream request the player fires (prefers the
    `…-got.htm` media playlist over the bare `.m3u8`).
-3. **Verifies** the URL returns `#EXTM3U` (with the canale-tv headers), then `POST`s it to
+4. **Verifies** the URL returns `#EXTM3U` (with the canale-tv headers), then `POST`s it to
    the proxy's token-gated `/admin/source`. The proxy no-ops if unchanged.
 
 ### Why real Chrome (not the bundled Chromium)
