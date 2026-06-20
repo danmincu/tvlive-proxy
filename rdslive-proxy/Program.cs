@@ -881,6 +881,9 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
     // hand the Chromecast our /stream.m3u8 URL directly; its built-in receiver
     // plays HLS, fetching segments through this proxy (same as VLC does).
     var castContext = null;
+    var remotePlayer = null, remoteController = null;
+    var castMode = null;       // 'live' | 'dvr'
+    var castVodFromMs = 0;     // fromUtc of the VOD snapshot currently on the cast (for seeking)
 
     window.initCast = function () {
       if (castContext || !window.__castApiAvailable) return;
@@ -889,6 +892,8 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
         receiverApplicationId: chrome.cast.media.DEFAULT_MEDIA_RECEIVER_APP_ID,
         autoJoinPolicy: chrome.cast.AutoJoinPolicy.ORIGIN_SCOPED
       });
+      // Lets the browser drive the cast session (seek it to follow our scrubbing).
+      try { remotePlayer = new cast.framework.RemotePlayer(); remoteController = new cast.framework.RemotePlayerController(remotePlayer); } catch (e) {}
       castContext.addEventListener(
         cast.framework.CastContextEventType.SESSION_STATE_CHANGED,
         function (e) {
@@ -908,31 +913,37 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
       return castContext && castContext.getCurrentSession();
     }
 
+    function castBaseUrl() {
+      // Chromecast can't validate our self-signed cert; always hand it the plain-http
+      // endpoint on the proxy's LAN IP (injected) — the Chromecast is local.
+      var castHost = "{{castHost}}" || window.location.hostname;
+      return 'http://' + castHost + ':' + {{httpPort}};
+    }
+
+    // (Re)load media on the cast based on where the browser is now: at the live edge ->
+    // the light live playlist; scrubbed back -> the DVR VOD positioned at exactly the
+    // wall-clock we're watching (hls.playingDate). Used for the initial cast and when
+    // crossing between live<->history.
     function castLoad() {
       var session = isCasting();
       if (!session) { setStatus('Cast: no active session'); return; }
-      // The Chromecast can't validate our self-signed cert, so always hand it the
-      // plain-http endpoint on the proxy's LAN IP (injected) — the Chromecast is local.
-      var castHost = "{{castHost}}" || window.location.hostname;
-      var castBase = 'http://' + castHost + ':' + {{httpPort}};
-      // At the live edge -> cast the light live playlist. Scrubbed back -> cast the DVR
-      // VOD starting at exactly the wall-clock position we're watching (hls.playingDate),
-      // so the Chromecast begins where the screen is instead of 24h ago.
+      var castBase = castBaseUrl();
       var pd = (hls && hls.playingDate) ? hls.playingDate.getTime() : null;
       if (!atLiveEdge() && pd !== null) {
         fetch('/dvr/status').then(function (r) { return r.json(); }).then(function (s) {
           var from = s.fromUtc ? Date.parse(s.fromUtc) : null;
           var offset = (from !== null) ? Math.max(0, (pd - from) / 1000) : 0;
-          castMedia(session, castBase, castBase + '/dvr.m3u8?vod=1&t=' + Date.now(), chrome.cast.media.StreamType.BUFFERED, offset);
-        }).catch(function () { castMedia(session, castBase, castBase + '/stream.m3u8?t=' + Date.now(), chrome.cast.media.StreamType.LIVE, 0); });
+          castVodFromMs = (from !== null) ? from : 0;
+          castMedia(session, castBase, castBase + '/dvr.m3u8?vod=1&t=' + Date.now(), chrome.cast.media.StreamType.BUFFERED, offset, 'dvr');
+        }).catch(function () { castMedia(session, castBase, castBase + '/stream.m3u8?t=' + Date.now(), chrome.cast.media.StreamType.LIVE, 0, 'live'); });
       } else {
-        castMedia(session, castBase, castBase + '/stream.m3u8?t=' + Date.now(), chrome.cast.media.StreamType.LIVE, 0);
+        castMedia(session, castBase, castBase + '/stream.m3u8?t=' + Date.now(), chrome.cast.media.StreamType.LIVE, 0, 'live');
       }
     }
 
-    function castMedia(session, castBase, url, streamType, startTime) {
-      console.log('[cast] loading', url, 'startTime', startTime);
-      setStatus('Casting… ' + url + (startTime ? ' @' + Math.round(startTime) + 's' : ''));
+    function castMedia(session, castBase, url, streamType, startTime, mode) {
+      console.log('[cast] loading', url, 'startTime', startTime, 'mode', mode);
+      setStatus('Casting… ' + (mode === 'live' ? 'live' : ('history @' + Math.round(startTime) + 's')));
       var info = new chrome.cast.media.MediaInfo(url, 'application/x-mpegurl');
       info.streamType = streamType;
       if (chrome.cast.media.HlsSegmentFormat) info.hlsSegmentFormat = chrome.cast.media.HlsSegmentFormat.TS;
@@ -940,7 +951,7 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
       var req = new chrome.cast.media.LoadRequest(info);
       if (startTime > 0) req.currentTime = startTime;
       session.loadMedia(req).then(
-        function () { setStatus('Casting to ' + session.getCastDevice().friendlyName); },
+        function () { castMode = mode; setStatus('Casting to ' + session.getCastDevice().friendlyName + (mode === 'dvr' ? ' (history)' : ' (live)')); },
         function (err) {
           var msg = (err && (err.description || err.code)) ? (err.description || err.code) : JSON.stringify(err);
           console.log('[cast] loadMedia FAILED:', err, 'url=', url);
@@ -949,6 +960,32 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
             ' on your network. If you opened this page via a public/DDNS address, set PROXY_CAST_HOST to the proxy’s LAN IP and rebuild.');
         }
       );
+    }
+
+    // Keep the cast in sync with the browser when we scrub / skip / go live. Seeks the
+    // existing cast media when possible (smooth, no reload); switches media only when
+    // crossing between live and history, or scrubbing past the loaded VOD snapshot.
+    var syncTimer = null;
+    function scheduleCastSync() { if (!isCasting()) return; clearTimeout(syncTimer); syncTimer = setTimeout(syncCast, 400); }
+    function syncCast() {
+      if (!isCasting()) return;
+      var pd = (hls && hls.playingDate) ? hls.playingDate.getTime() : null;
+      if (atLiveEdge() || pd === null) {
+        if (castMode !== 'live') castLoad();           // crossed back to live -> switch
+        return;
+      }
+      // scrubbed into history
+      if (castMode === 'dvr' && castVodFromMs && remotePlayer && remoteController) {
+        var target = (pd - castVodFromMs) / 1000;
+        var dur = remotePlayer.duration || 0;
+        if (target >= 0 && (dur === 0 || target <= dur + 1)) {
+          console.log('[cast] seek to', Math.round(target));
+          remotePlayer.currentTime = target;
+          remoteController.seek();
+          return;
+        }
+      }
+      castLoad(); // not on DVR yet, or scrubbed beyond the snapshot -> (re)load fresh
     }
 
     function castFail(msg) {
@@ -1004,7 +1041,7 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
       } catch (e) {}
       if (v.paused) v.play();
       setStatus('Playing — live');
-      if (isCasting()) castLoad();
+      scheduleCastSync();
     }
 
     // Skip ±N seconds, clamped to the buffer's seekable range.
@@ -1018,6 +1055,7 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
       } catch (err) { t = Math.max(0, t); }
       v.currentTime = t;
       if (v.paused) v.play();
+      scheduleCastSync();
     }
 
     // Restore the URL field to the active (resolver-managed) URL.
@@ -1112,6 +1150,9 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
 
     // Seed the rollback value with the URL the page loaded with.
     window.__currentUrl = document.getElementById('url').value;
+
+    // When the user scrubs the player, mirror the new position to the cast (if casting).
+    v.addEventListener('seeked', scheduleCastSync);
 
     // If the Cast SDK was already ready before this script ran, init now.
     window.initCast();
