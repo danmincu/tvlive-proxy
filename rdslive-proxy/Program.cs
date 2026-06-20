@@ -805,7 +805,8 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
   header { display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:8px 10px; background:#1b1b1b; border-bottom:1px solid #333; }
   .grp { display:flex; align-items:center; gap:8px; }
   .grp.url { flex:1 1 300px; min-width:0; }
-  .grp.ctl { flex:0 1 auto; }
+  .grp.ctl { flex:0 1 auto; flex-wrap:wrap; }
+  .seek, .utils { display:flex; align-items:center; gap:8px; }
   /* font-size:16px on the input stops iOS from zooming in on focus. */
   input { flex:1 1 auto; min-width:0; padding:10px; border:1px solid #444; border-radius:6px; background:#222; color:#eee; font-size:16px; }
   button, a.dl { padding:10px 14px; border:0; border-radius:6px; background:#2d7; color:#000; font-weight:600; font-size:14px; line-height:1; cursor:pointer; white-space:nowrap; text-align:center; display:inline-flex; align-items:center; justify-content:center; }
@@ -822,9 +823,11 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
   /* Phones: stack the two groups into full-width rows; the control buttons share
      their row and grow for comfortable tap targets. */
   @media (max-width:600px) {
-    .grp.url, .grp.ctl { flex:1 1 100%; }
-    .grp.ctl > button, .grp.ctl > a.dl { flex:1 1 auto; min-height:44px; }
-    google-cast-launcher { height:44px; width:52px; }
+    /* Each group becomes its own full-width row; buttons stretch edge-to-edge. */
+    .grp.url, .grp.ctl, .seek, .utils { flex:1 1 100%; }
+    .seek > button { flex:1 1 0; min-width:0; min-height:44px; padding:10px 2px; font-size:13px; }
+    .utils > button, .utils > a.dl { flex:1 1 auto; min-height:44px; }
+    .utils > google-cast-launcher { height:44px; width:64px; flex:0 0 auto; }
   }
 </style>
 </head>
@@ -837,14 +840,20 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
       <button onclick="load()">OK</button>
     </div>
     <div class="grp ctl">
-      <button class="alt" onclick="skip(-300)" title="Back 5 minutes">&#9194;5m</button>
-      <button class="alt" onclick="skip(-60)" title="Back 1 minute">&#9194;1m</button>
-      <button id="btnLive" onclick="goLive()" title="Jump to the live edge">&#9679; Live</button>
-      <button class="alt" onclick="skip(60)" title="Forward 1 minute">1m&#9193;</button>
-      <button class="alt" onclick="skip(300)" title="Forward 5 minutes">5m&#9193;</button>
-      <a class="dl" href="/dvr/export.ts" title="Download the recorded buffer as one .ts file">&#8595; .ts</a>
-      <button class="danger" onclick="wipeDvr()" title="Permanently delete ALL recordings">Wipe</button>
-      <google-cast-launcher id="castbtn" title="Cast to a Chromecast (open this page via your LAN IP, not localhost)"></google-cast-launcher>
+      <div class="seek">
+        <button class="alt" onclick="skip(-300)" title="Back 5 minutes">&#9194;5m</button>
+        <button class="alt" onclick="skip(-60)" title="Back 1 minute">&#9194;1m</button>
+        <button class="alt" onclick="skip(-10)" title="Back 10 seconds">&#9194;10s</button>
+        <button id="btnLive" onclick="goLive()" title="Jump to the live edge">&#9679;Live</button>
+        <button class="alt" onclick="skip(10)" title="Forward 10 seconds">10s&#9193;</button>
+        <button class="alt" onclick="skip(60)" title="Forward 1 minute">1m&#9193;</button>
+        <button class="alt" onclick="skip(300)" title="Forward 5 minutes">5m&#9193;</button>
+      </div>
+      <div class="utils">
+        <a class="dl" href="/dvr/export.ts" title="Download the recorded buffer as one .ts file">&#8595; .ts</a>
+        <button class="danger" onclick="wipeDvr()" title="Permanently delete ALL recordings">Wipe</button>
+        <google-cast-launcher id="castbtn" title="Cast to a Chromecast (open this page via your LAN IP, not localhost)"></google-cast-launcher>
+      </div>
     </div>
   </header>
   <div id="banner"></div>
