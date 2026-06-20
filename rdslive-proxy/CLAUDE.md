@@ -63,7 +63,7 @@ Routes in `Program.cs`, plus shared state (`StreamState`, `DvrStore` at the bott
 - `PROXY_ORIGIN` / `PROXY_REFERER` — the Origin/Referer headers sent upstream.
 - `PROXY_PORT` (default 13001) and `PROXY_BIND` (default `0.0.0.0` — required for the container to be reachable; set `127.0.0.1` to restrict to localhost).
 - `PROXY_HTTPS_PORT` (default 13443) — https port (self-signed) for the player page / Chromecast.
-- `PROXY_CAST_HOST` — LAN IP the Chromecast should fetch media from (needed when opening the player via a DDNS/public hostname); `run.sh` auto-detects it. Empty → uses the browser's hostname.
+- `PROXY_CAST_HOST` — the proxy's LAN IP, used as the Chromecast media host **only when the page is opened on the LAN** (private IP/localhost). When the page is opened via a **public/DDNS** host, the cast uses that public host instead (so a Chromecast in another house can reach the proxy over the internet — this requires the http port, e.g. 13001, to be **port-forwarded**, since the Chromecast can't validate the self-signed 13443 cert). `run.sh` auto-detects the LAN IP.
 - `PROXY_TIMEOUT_SECONDS` (default 15), `PROXY_RETRIES` (default 2) — upstream resilience.
 - `PROXY_DVR_ENABLED` (default true), `PROXY_DVR_DIR` (default `dvr`), `PROXY_DVR_HOURS` (default 24), `PROXY_DVR_POLL_SECONDS` (default 4) — DVR recording.
 - `PROXY_DVR_MIN_FREE_GB` (default 10) — secondary safety net: the janitor also prunes the oldest segments whenever free disk on the DVR volume drops below this, independent of the time window (0 disables).

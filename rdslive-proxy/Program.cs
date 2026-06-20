@@ -914,10 +914,17 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
     }
 
     function castBaseUrl() {
-      // Chromecast can't validate our self-signed cert; always hand it the plain-http
-      // endpoint on the proxy's LAN IP (injected) — the Chromecast is local.
-      var castHost = "{{castHost}}" || window.location.hostname;
-      return 'http://' + castHost + ':' + {{httpPort}};
+      // Chromecast can't validate our self-signed cert, so cast over plain HTTP. The host
+      // must be reachable from the Chromecast's network (= the browser's network):
+      //  - Page opened on the LAN (private IP / localhost): use the proxy's LAN IP
+      //    (PROXY_CAST_HOST), so a local Chromecast reaches it directly.
+      //  - Page opened via a public host (DDNS): use THAT host, so a Chromecast in another
+      //    house reaches the proxy over the internet — REQUIRES the http port forwarded.
+      var h = window.location.hostname;
+      var lan = "{{castHost}}"; // PROXY_CAST_HOST (may be empty)
+      var local = /^(localhost$|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(h);
+      var host = (local && lan) ? lan : h;
+      return 'http://' + host + ':' + {{httpPort}};
     }
 
     // (Re)load media on the cast based on where the browser is now: at the live edge ->
@@ -957,7 +964,7 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
           console.log('[cast] loadMedia FAILED:', err, 'url=', url);
           setStatus('Cast failed: ' + msg);
           castFail('Cast failed (' + msg + '). The Chromecast must be able to reach ' + castBase +
-            ' on your network. If you opened this page via a public/DDNS address, set PROXY_CAST_HOST to the proxy’s LAN IP and rebuild.');
+            ' from its network. At home: that LAN IP works. From another house (DDNS): forward the http port (e.g. 13001) on your router so that public address is reachable.');
         }
       );
     }

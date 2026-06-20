@@ -4,7 +4,9 @@ services:
     image: rdslive-proxy
     container_name: rdslive-proxy
     ports:
-      - "13001:13001"   # http  — media, VLC, Chromecast
+      - "13001:13001"   # http  — media, VLC, Chromecast (forward THIS on the router too
+                        #         if you want to cast from another house — the Chromecast
+                        #         can't use the self-signed 13443 cert, so it fetches http)
       - "13443:13443"   # https — player page / Chromecast button
     restart: unless-stopped
     environment:
