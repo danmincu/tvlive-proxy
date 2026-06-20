@@ -31,6 +31,7 @@ const PERIODIC_HOURS   = +(process.env.RESOLVE_PERIODIC_HOURS   || 4);
 const MIN_INTERVAL_SEC = +(process.env.RESOLVE_MIN_INTERVAL_SEC || 120);
 const NAV_TIMEOUT_MS   = +(process.env.RESOLVE_NAV_TIMEOUT_MS   || 45000);
 const HEADLESS         = /^(1|true|yes)$/i.test(process.env.HEADLESS || ''); // default headed (under xvfb)
+const FORCE_CAPTURE    = /^(1|true|yes)$/i.test(process.env.RESOLVE_FORCE_CAPTURE || ''); // skip probes, always run Chrome (for testing)
 
 const log = (...a) => console.log(new Date().toISOString(), '[resolver]', ...a);
 
@@ -112,13 +113,31 @@ async function fetchPlaylist(url) {
 
 async function verify(url) { return (await fetchPlaylist(url)) !== null; }
 
-// Is this URL serving a LIVE (advancing) playlist? Cheap HTTP probe — fetch twice and
-// confirm the media sequence advances, so we don't pick a host that's frozen/stalled.
+// Fetch the playlist's first segment and confirm it's real MPEG-TS (0x47 sync byte).
+// This catches the common stall where the PLAYLIST advances but the SEGMENTS are dead
+// (403/expired) — which a playlist-only check would wrongly call "live".
+async function segmentOk(playlistUrl, text) {
+  const seg = text.split('\n').map((l) => l.trim()).find((l) => l && !l.startsWith('#'));
+  if (!seg) return false;
+  let segUrl;
+  try { segUrl = new URL(seg, playlistUrl).href; } catch { return false; }
+  try {
+    const r = await fetch(segUrl, { headers: { accept: '*/*', origin: ORIGIN, referer: REFERER, 'user-agent': UA }, signal: AbortSignal.timeout(8000) });
+    if (!r.ok || !r.body) return false;
+    const reader = r.body.getReader();
+    const { value } = await reader.read();
+    reader.cancel().catch(() => {});
+    return !!value && value.length > 0 && value[0] === 0x47;
+  } catch { return false; }
+}
+
+// Is this URL FULLY working — advancing playlist AND fetchable MPEG-TS segments?
 async function probeLive(url) {
   const t1 = await fetchPlaylist(url);
   if (!t1) return false;
+  if (!(await segmentOk(url, t1))) return false; // playlist ok but segments dead -> not live
   const m1 = t1.match(/#EXT-X-MEDIA-SEQUENCE:(\d+)/);
-  if (!m1) return true; // valid playlist, can't measure -> accept
+  if (!m1) return true; // valid + segments ok, can't measure advance -> accept
   await sleep(3000);
   const t2 = await fetchPlaylist(url);
   if (!t2) return false;
@@ -157,30 +176,36 @@ async function resolve(reason) {
   try {
     log('resolving...', reason);
     const { current, recent } = await proxyGetState();
+    const isStall = /stall|down/i.test(reason);
 
-    // 1) If the current source is still live, there's nothing to do (handles the
-    //    periodic check, and stalls that recovered on their own).
-    if (current && await probeLive(current)) { log('current source still live, nothing to do'); return; }
+    if (FORCE_CAPTURE) {
+      log('FORCE_CAPTURE set — skipping probes, running browser capture');
+    } else {
+      // On a real stall the proxy can't record from `current`, so DON'T trust it —
+      // go find a different working host. On periodic/startup, if `current` is fully
+      // working (playlist advancing AND segments fetchable) there's nothing to do.
+      if (!isStall && current && await probeLive(current)) { log('current source still live, nothing to do'); return; }
 
-    // 2) Try the known-good host pool first (same path/token, the provider just rotates
-    //    the host). A quick HTTP probe — no browser. First live one wins.
-    for (const u of recent) {
-      if (u === current) continue;
-      if (await probeLive(u)) {
-        log('cached host is live:', u);
-        log(await proxyPush(u) ? 'switched to cached host' : 'push FAILED');
-        return;
+      // Try the known-good host pool (same path/token, provider just rotates the host).
+      // A cheap HTTP probe — no browser. First fully-working one wins.
+      for (const u of recent) {
+        if (u === current) continue;
+        if (await probeLive(u)) {
+          log('recovered via cached host:', u);
+          log(await proxyPush(u) ? 'pushed (cached host)' : 'push FAILED');
+          return;
+        }
       }
+      log('no cached host is live; running browser capture');
     }
 
-    // 3) None of the known hosts work (token likely rotated) — full browser capture.
-    log('no cached host live; running browser capture');
+    // Full browser capture (token likely rotated, or forced).
     const url = await captureUrl();
     if (!url) { log('no playlist URL captured'); return; }
     log('captured:', url);
     if (!(await verify(url))) { log('verification failed (not an HLS playlist), ignoring'); return; }
     if (current === url) { log('unchanged, nothing to do'); return; }
-    log(await proxyPush(url) ? 'pushed new source to proxy' : 'push FAILED');
+    log(await proxyPush(url) ? 'recovered via browser capture: ' + url : 'push FAILED');
   } catch (e) {
     log('resolve error:', e?.message || e);
   } finally {

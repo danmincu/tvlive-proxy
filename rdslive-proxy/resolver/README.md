@@ -42,6 +42,7 @@ a clickjack ad overlay sit over the play button (dismissed/peeled before clickin
 | `RESOLVE_POLL_SECONDS` | `30` | how often to check `/health` |
 | `RESOLVE_PERIODIC_HOURS` | `4` | proactive re-resolve interval |
 | `RESOLVE_MIN_INTERVAL_SEC` | `120` | never resolve more often than this |
+| `RESOLVE_FORCE_CAPTURE` | unset | set `1` to skip the host-pool probe and always run Chrome (testing) |
 | `PROXY_ORIGIN` / `PROXY_REFERER` | canale-tv.net | headers used to verify the URL |
 
 ## Caveats

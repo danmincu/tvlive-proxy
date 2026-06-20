@@ -69,7 +69,7 @@ services:
       # RESOLVE_POLL_SECONDS: "30"     # how often to check proxy /health
       # RESOLVE_PERIODIC_HOURS: "4"    # proactive re-resolve interval
       # RESOLVE_MIN_INTERVAL_SEC: "120"# never resolve more often than this
-      # RESOLVE_PATTERN: "\\.cfd/.*-got\\.htm"  # regex for the playlist request URL
+      # RESOLVE_FORCE_CAPTURE: "1"     # TEST: skip the host-pool probe, always run Chrome
 
 volumes:
   dvr-data:
