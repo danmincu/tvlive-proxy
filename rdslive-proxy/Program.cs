@@ -166,9 +166,18 @@ builder.Services.AddSingleton(_ => new HttpClient(new SocketsHttpHandler
 // requires CORS headers (a same-origin browser does not). Allow everything.
 builder.Services.AddCors();
 
+// gzip the (large) generated HLS playlists — the full-window DVR manifest is ~1MB but
+// compresses ~10-20x. Only m3u8 (not the TS segments) is compressed.
+builder.Services.AddResponseCompression(o =>
+{
+    o.EnableForHttps = true;
+    o.MimeTypes = new[] { "application/vnd.apple.mpegurl", "application/x-mpegurl", "text/html", "application/json" };
+});
+
 var app = builder.Build();
 var log = app.Logger;
 
+app.UseResponseCompression();
 app.UseCors(p => p.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod());
 
 // The rolling DVR store (segment files + in-memory/​on-disk index). Loaded from
@@ -281,12 +290,22 @@ static string BuildDvrPlaylist(DvrSeg[] segs, bool endlist)
     sb.Append("#EXT-X-TARGETDURATION:").Append((int)Math.Ceiling(maxDur)).Append('\n');
     sb.Append("#EXT-X-MEDIA-SEQUENCE:").Append(segs.Length > 0 ? segs[0].Id : 0).Append('\n');
     if (endlist) sb.Append("#EXT-X-PLAYLIST-TYPE:VOD\n");
+    bool needPdt = true; // emit PROGRAM-DATE-TIME on the first segment and after each
+                         // discontinuity — lets the player map playhead -> wall-clock
+                         // (hls.playingDate), used for seeking and cast-from-position.
     for (int i = 0; i < segs.Length; i++)
     {
         var s = segs[i];
         // A discontinuity tag before the FIRST segment is meaningless and trips some
         // players (notably the Chromecast receiver) — only emit it between segments.
-        if (s.Disc && i > 0) sb.Append("#EXT-X-DISCONTINUITY\n");
+        if (s.Disc && i > 0) { sb.Append("#EXT-X-DISCONTINUITY\n"); needPdt = true; }
+        if (needPdt)
+        {
+            sb.Append("#EXT-X-PROGRAM-DATE-TIME:")
+              .Append(s.Utc.ToString("yyyy-MM-ddTHH:mm:ss.fffZ", CultureInfo.InvariantCulture))
+              .Append('\n');
+            needPdt = false;
+        }
         sb.Append("#EXTINF:").Append(s.Dur.ToString("0.000", CultureInfo.InvariantCulture)).Append(",\n");
         sb.Append("/dvr/seg/").Append(s.Id.ToString("D12")).Append(".ts\n");
     }
@@ -818,10 +837,11 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
       <button onclick="load()">OK</button>
     </div>
     <div class="grp ctl">
-      <button id="btnLive" class="alt" onclick="goLive()" title="Live edge">Live</button>
-      <button id="btnDvr" class="alt" onclick="goDvr()" title="Timeshift / DVR — scrub back through the recorded window">DVR</button>
-      <button class="alt" onclick="skip(-10)" title="Back 10 seconds">&#9194;10</button>
-      <button class="alt" onclick="skip(10)" title="Forward 10 seconds">10&#9193;</button>
+      <button class="alt" onclick="skip(-300)" title="Back 5 minutes">&#9194;5m</button>
+      <button class="alt" onclick="skip(-60)" title="Back 1 minute">&#9194;1m</button>
+      <button id="btnLive" onclick="goLive()" title="Jump to the live edge">&#9679; Live</button>
+      <button class="alt" onclick="skip(60)" title="Forward 1 minute">1m&#9193;</button>
+      <button class="alt" onclick="skip(300)" title="Forward 5 minutes">5m&#9193;</button>
       <a class="dl" href="/dvr/export.ts" title="Download the recorded buffer as one .ts file">&#8595; .ts</a>
       <button class="danger" onclick="wipeDvr()" title="Permanently delete ALL recordings">Wipe</button>
       <google-cast-launcher id="castbtn" title="Cast to a Chromecast (open this page via your LAN IP, not localhost)"></google-cast-launcher>
@@ -883,21 +903,35 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
       var session = isCasting();
       if (!session) { setStatus('Cast: no active session'); return; }
       // The Chromecast can't validate our self-signed cert, so always hand it the
-      // plain-http endpoint. Prefer the server's LAN IP (injected) since the
-      // Chromecast is local; fall back to the browser's hostname.
+      // plain-http endpoint on the proxy's LAN IP (injected) — the Chromecast is local.
       var castHost = "{{castHost}}" || window.location.hostname;
       var castBase = 'http://' + castHost + ':' + {{httpPort}};
-      // Cast whatever is currently playing (live or the DVR timeshift playlist).
-      var url = castBase + currentPath + (currentPath.indexOf('?') >= 0 ? '&' : '?') + 't=' + Date.now();
-      console.log('[cast] loading on device:', url);
-      setStatus('Casting… ' + url);
+      // At the live edge -> cast the light live playlist. Scrubbed back -> cast the DVR
+      // VOD starting at exactly the wall-clock position we're watching (hls.playingDate),
+      // so the Chromecast begins where the screen is instead of 24h ago.
+      var pd = (hls && hls.playingDate) ? hls.playingDate.getTime() : null;
+      if (!atLiveEdge() && pd !== null) {
+        fetch('/dvr/status').then(function (r) { return r.json(); }).then(function (s) {
+          var from = s.fromUtc ? Date.parse(s.fromUtc) : null;
+          var offset = (from !== null) ? Math.max(0, (pd - from) / 1000) : 0;
+          castMedia(session, castBase, castBase + '/dvr.m3u8?vod=1&t=' + Date.now(), chrome.cast.media.StreamType.BUFFERED, offset);
+        }).catch(function () { castMedia(session, castBase, castBase + '/stream.m3u8?t=' + Date.now(), chrome.cast.media.StreamType.LIVE, 0); });
+      } else {
+        castMedia(session, castBase, castBase + '/stream.m3u8?t=' + Date.now(), chrome.cast.media.StreamType.LIVE, 0);
+      }
+    }
+
+    function castMedia(session, castBase, url, streamType, startTime) {
+      console.log('[cast] loading', url, 'startTime', startTime);
+      setStatus('Casting… ' + url + (startTime ? ' @' + Math.round(startTime) + 's' : ''));
       var info = new chrome.cast.media.MediaInfo(url, 'application/x-mpegurl');
-      info.streamType = chrome.cast.media.StreamType.LIVE;
-      // The segments are MPEG-TS; tell the receiver so it doesn't have to guess.
+      info.streamType = streamType;
       if (chrome.cast.media.HlsSegmentFormat) info.hlsSegmentFormat = chrome.cast.media.HlsSegmentFormat.TS;
       if (chrome.cast.media.HlsVideoSegmentFormat) info.hlsVideoSegmentFormat = chrome.cast.media.HlsVideoSegmentFormat.MPEG2_TS;
-      session.loadMedia(new chrome.cast.media.LoadRequest(info)).then(
-        function () { setStatus('Casting to ' + session.getCastDevice().friendlyName); console.log('[cast] loadMedia OK'); },
+      var req = new chrome.cast.media.LoadRequest(info);
+      if (startTime > 0) req.currentTime = startTime;
+      session.loadMedia(req).then(
+        function () { setStatus('Casting to ' + session.getCastDevice().friendlyName); },
         function (err) {
           var msg = (err && (err.description || err.code)) ? (err.description || err.code) : JSON.stringify(err);
           console.log('[cast] loadMedia FAILED:', err, 'url=', url);
@@ -914,70 +948,54 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
     }
     // -------------------------------------------------------------------------
 
-    // The source currently loaded into the player: live ('/stream.m3u8') or the
-    // DVR timeshift playlist ('/dvr.m3u8'). Cast and reload follow this.
-    var currentPath = '/stream.m3u8';
+    // ONE unified timeline: the full DVR window served as a LIVE playlist. Default is
+    // the live edge; the user can scrub back through the whole window or press ● Live.
+    var currentPath = '/stream.m3u8';   // actual source loaded (set by play)
+    var dvrEnabled = false, dvrSegments = 0;
 
-    function play(path, startPos) {
+    // Use the full scrubable DVR timeline when it has content; otherwise the light live
+    // passthrough (DVR disabled, or cold start before the first segment is recorded).
+    function chooseSrc() { return (dvrEnabled && dvrSegments > 0) ? '/dvr.m3u8' : '/stream.m3u8'; }
+
+    // Are we within ~30s of the live edge (vs scrubbed back into history)?
+    function atLiveEdge() {
+      try {
+        if (v.seekable && v.seekable.length) return (v.seekable.end(v.seekable.length - 1) - v.currentTime) < 30;
+      } catch (e) {}
+      return true;
+    }
+
+    function play(path) {
       currentPath = path;
-      var live = path.indexOf('/dvr.m3u8') < 0;
-      var seekTo = (!live && typeof startPos === 'number' && startPos > 0) ? startPos : -1;
-      document.getElementById('btnLive').classList.toggle('active', live);
-      document.getElementById('btnDvr').classList.toggle('active', !live);
       var src = path + (path.indexOf('?') >= 0 ? '&' : '?') + 't=' + Date.now();
       if (window.Hls && Hls.isSupported()) {
         if (hls) hls.destroy();
-        var cfg = { liveSyncDuration: 12 };
-        if (seekTo > 0) cfg.startPosition = seekTo;   // open DVR at the resume/live-edge point
-        hls = new Hls(cfg);
+        // liveMaxLatencyDurationCount:Infinity => never force-snap to the edge, so you
+        // can rewind freely on this live playlist. backBufferLength:Infinity keeps the
+        // rewound buffer. liveSyncDurationCount:3 => start a few segments from the edge.
+        hls = new Hls({ liveSyncDurationCount: 3, liveMaxLatencyDurationCount: Infinity, backBufferLength: Infinity });
         hls.loadSource(src);
         hls.attachMedia(v);
-        hls.on(Hls.Events.MANIFEST_PARSED, function () { v.play(); setStatus(live ? 'Playing (live)' : 'Playing (DVR — seek anywhere; re-click DVR for newer)'); });
+        hls.on(Hls.Events.MANIFEST_PARSED, function () { v.play(); setStatus('Playing — live'); });
         hls.on(Hls.Events.ERROR, function (e, d) {
           if (d.fatal) { setStatus('Error: ' + d.type + ' / ' + d.details); refreshHealth(); }
         });
       } else {
-        // Safari / native HLS
-        v.src = src;
-        if (seekTo > 0) {
-          v.addEventListener('loadedmetadata', function once() { v.removeEventListener('loadedmetadata', once); try { v.currentTime = seekTo; } catch (e) {} });
-        }
-        v.play();
-        setStatus(live ? 'Playing (native HLS)' : 'Playing (DVR, native)');
+        v.src = src; v.play(); setStatus('Playing (native HLS)');
       }
     }
 
-    function isDvr() { return currentPath.indexOf('/dvr.m3u8') >= 0; }
+    function start() { play(chooseSrc()); }
 
-    // For resume: remember the wallclock instant we're watching in the DVR (not a raw
-    // offset, which shifts as old segments are pruned). Keyed per stream URL per browser.
-    var dvrFromMs = 0;
-    function dvrKey() { return 'dvrResume:' + ((document.getElementById('url').value || '').trim() || 'default'); }
-
-    function saveDvrPos() {
-      if (!isDvr() || !dvrFromMs) return;
-      try { localStorage.setItem(dvrKey(), String(Math.round(dvrFromMs + v.currentTime * 1000))); } catch (e) {}
-    }
-
-    function start()  { play('/stream.m3u8'); }
-    function goLive() { play('/stream.m3u8'); if (isCasting()) castLoad(); }
-
-    // Load DVR as VOD (ENDLIST) so it's a fixed, fully-seekable recording — hls.js
-    // won't reload it or snap to the live edge. Open at the saved spot for this browser,
-    // else at the live edge (most recent). Re-click DVR to pull in newer recordings.
-    function goDvr() {
-      fetch('/dvr/status').then(function (r) { return r.json(); }).then(function (s) {
-        var start = -1;
-        if (s.fromUtc && s.toUtc) {
-          var from = Date.parse(s.fromUtc), to = Date.parse(s.toUtc);
-          dvrFromMs = from;
-          var saved = parseFloat(localStorage.getItem(dvrKey()) || '');
-          var targetMs = (saved && saved > from + 1000 && saved < to - 1000) ? saved : (to - 15000);
-          start = Math.max(0, (targetMs - from) / 1000);
-        }
-        play('/dvr.m3u8?vod=1', start);
-        if (isCasting()) castLoad();
-      }).catch(function () { play('/dvr.m3u8?vod=1', -1); });
+    // Jump to the live edge ("become live").
+    function goLive() {
+      try {
+        if (hls && typeof hls.liveSyncPosition === 'number' && !isNaN(hls.liveSyncPosition)) v.currentTime = hls.liveSyncPosition;
+        else if (v.seekable && v.seekable.length) v.currentTime = v.seekable.end(v.seekable.length - 1);
+      } catch (e) {}
+      if (v.paused) v.play();
+      setStatus('Playing — live');
+      if (isCasting()) castLoad();
     }
 
     // Skip ±N seconds, clamped to the buffer's seekable range.
@@ -1024,33 +1042,33 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
         .then(function (r) {
           if (r.status === 403) { alert('Wrong password — nothing was deleted.'); return; }
           if (!r.ok) { alert('Failed to delete (HTTP ' + r.status + ').'); return; }
-          return r.json().then(function (j) { alert('Deleted all DVR recordings (' + (j.cleared || 0) + ' segments).'); refreshDvr(); });
+          return r.json().then(function (j) { alert('Deleted all DVR recordings (' + (j.cleared || 0) + ' segments).'); refreshDvrStatus(); });
         })
         .catch(function (e) { alert('Failed: ' + e.message); });
     }
 
-    // Stall watchdog: if LIVE playback stops advancing while we believe we're playing,
-    // reload to recover (e.g. a wedged hls.js after a freeze). Never in DVR mode — a
-    // reload there would jump out of the recording the user is watching.
+    // Stall watchdog: if playback stops advancing AT THE LIVE EDGE, reload to recover
+    // (e.g. a wedged hls.js after a freeze). Skip when scrubbed back — a reload would
+    // yank the user out of the history they're watching.
     var wdLastTime = 0, wdStalledSince = 0;
     setInterval(function () {
-      if (isDvr()) { wdStalledSince = 0; return; }
+      if (!atLiveEdge()) { wdStalledSince = 0; return; }
       if (v.paused || v.seeking || v.readyState < 2) { wdLastTime = v.currentTime; wdStalledSince = 0; return; }
       if (v.currentTime > wdLastTime + 0.25) { wdLastTime = v.currentTime; wdStalledSince = 0; return; }
       if (wdStalledSince === 0) { wdStalledSince = Date.now(); return; }
       if (Date.now() - wdStalledSince > 15000) {
         wdStalledSince = 0; wdLastTime = 0;
         setStatus('Stalled — reloading…');
-        play(currentPath);
+        play(chooseSrc());
       }
     }, 5000);
 
-    // Show how much is recorded, next to the DVR button.
-    function refreshDvr() {
+    // Track DVR availability (for chooseSrc) and show how much is buffered on the Live button.
+    function refreshDvrStatus() {
       fetch('/dvr/status').then(function (r) { return r.json(); }).then(function (s) {
-        var btn = document.getElementById('btnDvr');
-        if (!s.enabled) { btn.textContent = 'DVR off'; btn.disabled = true; return; }
-        btn.textContent = 'DVR ' + (s.hours || 0).toFixed(1) + 'h';
+        dvrEnabled = !!s.enabled; dvrSegments = s.segments || 0;
+        var btn = document.getElementById('btnLive');
+        if (btn) btn.title = dvrEnabled ? ('Jump to the live edge — ' + (s.hours || 0).toFixed(1) + 'h recorded, scrub back anytime') : 'Jump to the live edge';
       }).catch(function () {});
     }
 
@@ -1071,35 +1089,36 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
           b.className = ''; b.textContent = '';
         } else if (h.ok === false) {
           b.textContent = '⚠ ' + (h.error || 'Source unavailable') +
-            '. Paste a fresh URL above and press OK. Recording is paused, but your recording is intact — press DVR to watch it.';
+            '. Paste a fresh URL above and press OK. Recording is paused, but what you already recorded is intact — scrub back to watch it.';
           b.className = 'show';
         } else {
           b.className = ''; b.textContent = '';
-          // Recovered after being down — reload to catch the live edge, but only in
-          // live mode (don't yank someone out of the DVR recording they're watching).
-          if (!lastHealthOk && !isDvr()) play(currentPath);
+          // Recovered after being down — reload to catch the live edge, but only if the
+          // user is at the live edge (don't yank someone out of the history they're watching).
+          if (!lastHealthOk && atLiveEdge()) play(chooseSrc());
         }
         lastHealthOk = (h.ok !== false);
       }).catch(function () {});
     }
-
-    // Persist the DVR watch position (per browser) so re-opening DVR resumes there.
-    setInterval(saveDvrPos, 5000);
-    v.addEventListener('pause', saveDvrPos);
-    window.addEventListener('pagehide', saveDvrPos);
 
     // Seed the rollback value with the URL the page loaded with.
     window.__currentUrl = document.getElementById('url').value;
 
     // If the Cast SDK was already ready before this script ran, init now.
     window.initCast();
-    refreshDvr();
     refreshHealth();
-    setInterval(refreshDvr, 15000);
+    setInterval(refreshDvrStatus, 15000);
     setInterval(refreshHealth, 10000);
 
-    // Auto-start if a URL was pre-loaded at server startup.
-    if (document.getElementById('url').value.trim()) start();
+    // Learn whether DVR is available, then start on the right source (live edge).
+    function bootstrap() {
+      fetch('/dvr/status').then(function (r) { return r.json(); }).then(function (s) {
+        dvrEnabled = !!s.enabled; dvrSegments = s.segments || 0;
+      }).catch(function () {}).then(function () {
+        if (document.getElementById('url').value.trim()) start();
+      });
+    }
+    bootstrap();
   </script>
 </body>
 </html>
