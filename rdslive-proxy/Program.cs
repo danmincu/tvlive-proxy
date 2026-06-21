@@ -1278,21 +1278,21 @@ sealed class DvrStore
 
     public DvrSeg[] Snapshot() { lock (_gate) return _segs.ToArray(); }
 
-    // The newest up-to-maxSegments segments that belong to the current channel
-    // (latest session) — the "live edge" served to all viewers.
+    // The newest up-to-maxSegments segments — the "live edge" served to all viewers.
+    // NOT filtered by session: the window slides smoothly across a channel/URL switch
+    // with contiguous MEDIA-SEQUENCE and a #EXT-X-DISCONTINUITY at the boundary (the
+    // first segment of a new session carries Disc). Filtering to the current session
+    // made the playlist abruptly reset + the sequence jump, which stops the Chromecast
+    // receiver mid-cast (hls.js on the full /dvr.m3u8 tolerates it; the receiver does not).
+    // The live edge is always the newest segment regardless, so a viewer at the edge
+    // still sees the new channel immediately.
     public DvrSeg[] LiveWindow(int maxSegments)
     {
         lock (_gate)
         {
             int n = _segs.Count;
             if (n == 0) return Array.Empty<DvrSeg>();
-            long sess = _segs[n - 1].Session;
-            int start = n, count = 0;
-            for (int i = n - 1; i >= 0 && count < maxSegments; i--)
-            {
-                if (_segs[i].Session != sess) break;
-                start = i; count++;
-            }
+            int start = Math.Max(0, n - maxSegments);
             var res = new DvrSeg[n - start];
             _segs.CopyTo(start, res, 0, n - start);
             return res;
