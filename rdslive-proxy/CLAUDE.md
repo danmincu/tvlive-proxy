@@ -18,9 +18,27 @@ dotnet build               # compile only
 Container (host needs **only Docker**, never .NET — the SDK lives in the build stage):
 ```bash
 ./build.sh    # docker compose build --pull --no-cache
-./run.sh      # docker compose up -d --build  (detached, restart=unless-stopped)
-./stop.sh     # docker compose down
+./run.sh      # primary antena-1 stack on 13001/13443, 24h DVR (detached, restart=unless-stopped)
+./stop.sh     # docker compose down (the primary stack)
 ```
+
+**Multiple channels:** `run.sh`/`stop.sh` are parameterized so each channel runs as its own
+Compose stack (own ports, own DVR volume `rdslive-<name>_dvr-data`, own resolver `SOURCE_PAGE`).
+The bare `./run.sh` is the **primary** stack (project = directory default, container `rdslive-proxy`,
+volume unchanged) so an existing install is updated in place, not duplicated. Any deviation
+(`--source`/`--name`/non-default ports) makes a namespaced stack `rdslive-<name>`.
+```bash
+./run.sh --source https://rdslive.org/antena-3-cnn/ --http 14001 --https 14443 --dvr-hours 6
+./stop.sh antena-3-cnn          # stop that channel (name = last path segment of --source, or --name)
+./run.sh --help                 # all flags: --source --http --https --dvr-hours --ip --name
+```
+`run.sh` exports `SOURCE_PAGE`, `PROXY_PORT`, `PROXY_HTTPS_PORT`, `PROXY_DVR_HOURS`,
+`PROXY_CAST_HOST`, plus `COMPOSE_PROJECT_NAME`/`CHANNEL_SUFFIX` (empty for primary) which
+`docker-compose.yml` consumes. The proxy listens on `PROXY_PORT`/`PROXY_HTTPS_PORT` inside the
+container (must match the published ports); the resolver reaches it at `rdslive-proxy:$PROXY_PORT`
+on the per-stack internal network. A fresh channel briefly has the stale antena-1 default URL
+until its resolver discovers the right one (the recorder rejects the dead default, recording nothing
+until then — so no wrong-channel content is stored).
 
 There are no tests or linters. Verify changes by running the app and hitting the endpoints (the dev box already has .NET; on Windows the process locks `bin/.../rdslive-proxy.exe`, so `taskkill //F //IM rdslive-proxy.exe` before rebuilding while an instance is running).
 

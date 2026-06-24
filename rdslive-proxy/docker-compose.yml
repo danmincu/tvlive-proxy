@@ -2,14 +2,20 @@ services:
   rdslive-proxy:
     build: .
     image: rdslive-proxy
-    container_name: rdslive-proxy
+    # CHANNEL_SUFFIX is empty for the primary stack and "-<channel>" for extra channels,
+    # so two channels don't collide on container names. run.sh sets it (+ COMPOSE_PROJECT_NAME).
+    container_name: "rdslive-proxy${CHANNEL_SUFFIX:-}"
     ports:
-      - "13001:13001"   # http  — media, VLC, Chromecast (forward THIS on the router too
-                        #         if you want to cast from another house — the Chromecast
-                        #         can't use the self-signed 13443 cert, so it fetches http)
-      - "13443:13443"   # https — player page / Chromecast button
+      # Ports are parameterized so you can run a second channel on e.g. 14001/14443.
+      # Forward the http port on the router if you want to cast from another house — the
+      # Chromecast can't use the self-signed https cert, so it fetches over http.
+      - "${PROXY_PORT:-13001}:${PROXY_PORT:-13001}"               # http  — media, VLC, Chromecast
+      - "${PROXY_HTTPS_PORT:-13443}:${PROXY_HTTPS_PORT:-13443}"   # https — player page / cast button
     restart: unless-stopped
     environment:
+      # The proxy listens on these inside the container; they must match the published ports.
+      PROXY_PORT: "${PROXY_PORT:-13001}"
+      PROXY_HTTPS_PORT: "${PROXY_HTTPS_PORT:-13443}"
       # Pre-load a stream so it auto-plays for every visitor (optional):
       # PROXY_PLAYLIST_URL: "https://alpha1.yosefina1.cfd/ah1/usergenx304Jtlrnd2-got.htm"
       PROXY_ORIGIN: "https://canale-tv.net"
@@ -26,7 +32,7 @@ services:
       # .ts export. Stored under /app/dvr (persisted via the volume below).
       # Disk use ~= bitrate; e.g. 3 Mbps ~= 1.4 GB/h ~= 32 GB for 24h.
       PROXY_DVR_ENABLED: "true"
-      PROXY_DVR_HOURS: "24"
+      PROXY_DVR_HOURS: "${PROXY_DVR_HOURS:-24}"
       # PROXY_DVR_POLL_SECONDS: "4"
       # Live fan-out: with DVR on, ALL viewers are served from the local buffer at the
       # live edge, so the provider only sees the single recorder ingest no matter how
@@ -54,14 +60,16 @@ services:
   resolver:
     build: ./resolver
     image: rdslive-resolver
-    container_name: rdslive-resolver
+    container_name: "rdslive-resolver${CHANNEL_SUFFIX:-}"
     depends_on:
       - rdslive-proxy
     restart: unless-stopped
     environment:
-      PROXY_BASE: "http://rdslive-proxy:13001"
+      # Reaches the proxy by service name on the internal network, on its (parameterized) port.
+      PROXY_BASE: "http://rdslive-proxy:${PROXY_PORT:-13001}"
       PROXY_ADMIN_TOKEN: "${PROXY_ADMIN_TOKEN:-change-me-please}"
-      SOURCE_PAGE: "https://rdslive.org/antena-1/"
+      # The channel this stack resolves/records. run.sh sets it from --source.
+      SOURCE_PAGE: "${SOURCE_PAGE:-https://rdslive.org/antena-1/}"
       SOURCE_REFERER: "https://rdslive.org/"
       # Alternative if the wrapper misbehaves — load the embedded player directly:
       #   SOURCE_PAGE: "https://rdslive.org/tv.php?id=a1"
