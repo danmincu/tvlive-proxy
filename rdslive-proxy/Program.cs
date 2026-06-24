@@ -900,7 +900,16 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
           console.log('[cast] session state:', e.sessionState);
           if (e.sessionState === cast.framework.SessionState.SESSION_STARTED ||
               e.sessionState === cast.framework.SessionState.SESSION_RESUMED) {
-            castLoad();
+            // If we're restoring a scrubbed-back position (e.g. a refresh re-joined the TV
+            // mid-game), sync the TV straight to that saved instant — NOT the live edge, so
+            // it doesn't flash the final score. Otherwise cast whatever we're playing now.
+            if (restorePending) {
+              var r = loadResume();
+              if (r && !r.atLive) { castDvrAt(r.dateMs); }
+              else castLoad();
+            } else {
+              castLoad();
+            }
           } else if (e.sessionState === cast.framework.SessionState.SESSION_START_FAILED) {
             setStatus('Cast: session failed to start');
             castFail('Cast session failed to start — check the Chromecast is on the same network.');
@@ -995,6 +1004,20 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
       castLoad(); // not on DVR yet, or scrubbed beyond the snapshot -> (re)load fresh
     }
 
+    // Cast the DVR VOD positioned at a specific wall-clock instant (independent of the
+    // browser's own playhead). Used on cast reconnect to snap the TV to the saved spot.
+    function castDvrAt(dateMs) {
+      var session = isCasting();
+      if (!session) return;
+      var castBase = castBaseUrl();
+      fetch('/dvr/status').then(function (r) { return r.json(); }).then(function (s) {
+        var from = s.fromUtc ? Date.parse(s.fromUtc) : null;
+        var offset = (from !== null) ? Math.max(0, (dateMs - from) / 1000) : 0;
+        castVodFromMs = (from !== null) ? from : 0;
+        castMedia(session, castBase, castBase + '/dvr.m3u8?vod=1&t=' + Date.now(), chrome.cast.media.StreamType.BUFFERED, offset, 'dvr');
+      }).catch(function () { castLoad(); });
+    }
+
     function castFail(msg) {
       var b = document.getElementById('banner');
       if (b) { b.textContent = '⚠ ' + msg; b.className = 'show'; }
@@ -1016,6 +1039,64 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
         if (v.seekable && v.seekable.length) return (v.seekable.end(v.seekable.length - 1) - v.currentTime) < 30;
       } catch (e) {}
       return true;
+    }
+
+    // --- Resume (per-browser localStorage) ----------------------------------
+    // Remember the WALL-CLOCK instant being watched (robust to the DVR window sliding as
+    // old segments prune) + whether we were live. A refresh / cast-reconnect resumes there
+    // instead of jumping to the live edge — so you don't get spoiled the final score.
+    var RESUME_KEY = 'rdslive:resume';
+    var RESUME_MAX_AGE_MS = 24 * 3600 * 1000;   // older than this -> treat as a fresh visit (go live)
+    var restorePending = false;
+
+    function watchingDateMs() { return (hls && hls.playingDate) ? hls.playingDate.getTime() : 0; }
+
+    function saveResume() {
+      try {
+        var dateMs = watchingDateMs();
+        if (!dateMs) return;
+        localStorage.setItem(RESUME_KEY, JSON.stringify({ atLive: atLiveEdge(), dateMs: dateMs, savedAt: Date.now() }));
+      } catch (e) {}
+    }
+
+    function loadResume() {
+      try {
+        var s = JSON.parse(localStorage.getItem(RESUME_KEY) || 'null');
+        if (!s || !s.dateMs || !s.savedAt) return null;
+        if (Date.now() - s.savedAt > RESUME_MAX_AGE_MS) return null;
+        return s;
+      } catch (e) { return null; }
+    }
+
+    // Seek the player to a wall-clock instant, mapped via the known (currentTime, playingDate)
+    // pair and clamped to what's actually recorded/buffered.
+    function seekToDate(targetMs) {
+      if (!(hls && hls.playingDate)) return false;
+      var t = v.currentTime + (targetMs - hls.playingDate.getTime()) / 1000;
+      try {
+        if (v.seekable && v.seekable.length) t = Math.min(Math.max(t, v.seekable.start(0)), v.seekable.end(v.seekable.length - 1));
+      } catch (e) {}
+      v.currentTime = t;
+      if (v.paused) v.play();
+      return true;
+    }
+
+    // After (re)loading the live timeline, wait for hls.js to expose a playingDate, then seek
+    // to the saved instant and re-sync any (reconnected) cast to the same spot.
+    function applyRestore(targetMs) {
+      restorePending = true;
+      var tries = 0;
+      (function attempt() {
+        if (hls && hls.playingDate && v.readyState >= 1) {
+          seekToDate(targetMs);
+          restorePending = false;
+          setStatus('Resumed where you left off — press ● Live for live');
+          saveResume();
+          scheduleCastSync();        // push the restored position to a connected TV
+          return;
+        }
+        if (tries++ < 60) setTimeout(attempt, 150); else restorePending = false;  // ~9s cap
+      })();
     }
 
     function play(path) {
@@ -1049,6 +1130,7 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
       if (v.paused) v.play();
       setStatus('Playing — live');
       scheduleCastSync();
+      saveResume();
     }
 
     // Skip ±N seconds, clamped to the buffer's seekable range.
@@ -1063,6 +1145,7 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
       v.currentTime = t;
       if (v.paused) v.play();
       scheduleCastSync();
+      saveResume();
     }
 
     // Restore the URL field to the active (resolver-managed) URL.
@@ -1158,8 +1241,16 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
     // Seed the rollback value with the URL the page loaded with.
     window.__currentUrl = document.getElementById('url').value;
 
-    // When the user scrubs the player, mirror the new position to the cast (if casting).
-    v.addEventListener('seeked', scheduleCastSync);
+    // When the user scrubs the player, mirror the new position to the cast (if casting)
+    // and remember the spot so a refresh resumes here.
+    v.addEventListener('seeked', function () { scheduleCastSync(); saveResume(); });
+
+    // Persist the watch position continuously and on the events that precede a sleep/close,
+    // so a refresh / cast-reconnect can resume exactly where we were.
+    setInterval(saveResume, 5000);
+    v.addEventListener('pause', saveResume);
+    document.addEventListener('visibilitychange', function () { if (document.hidden) saveResume(); });
+    window.addEventListener('pagehide', saveResume);
 
     // If the Cast SDK was already ready before this script ran, init now.
     window.initCast();
@@ -1167,12 +1258,16 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
     setInterval(refreshDvrStatus, 15000);
     setInterval(refreshHealth, 10000);
 
-    // Learn whether DVR is available, then start on the right source (live edge).
+    // Learn whether DVR is available, then start: resume a scrubbed-back spot if we saved
+    // one recently (so a refresh keeps your place mid-game); otherwise start at the live edge.
     function bootstrap() {
       fetch('/dvr/status').then(function (r) { return r.json(); }).then(function (s) {
         dvrEnabled = !!s.enabled; dvrSegments = s.segments || 0;
       }).catch(function () {}).then(function () {
-        if (document.getElementById('url').value.trim()) start();
+        if (!document.getElementById('url').value.trim()) return;
+        var r = (dvrEnabled && dvrSegments > 0) ? loadResume() : null;
+        if (r && !r.atLive) { play('/dvr.m3u8'); applyRestore(r.dateMs); }  // resume where we left off
+        else start();                                                       // live (default / was-live)
       });
     }
     bootstrap();
