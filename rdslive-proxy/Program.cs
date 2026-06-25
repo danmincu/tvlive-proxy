@@ -281,13 +281,19 @@ static bool LooksLikeHlsPlaylist(string body) =>
 // Build an HLS media playlist from recorded segments, pointing at the local
 // /dvr/seg/<id>.ts files. endlist=false => live (player tracks the edge); true =>
 // closed VOD (fully seekable, no refresh).
-static string BuildDvrPlaylist(DvrSeg[] segs, bool endlist)
+static string BuildDvrPlaylist(DvrSeg[] segs, bool endlist, double holdBackSec = 0)
 {
     var sb = new StringBuilder();
     sb.Append("#EXTM3U\n#EXT-X-VERSION:6\n");
     double maxDur = 6;
     foreach (var s in segs) if (s.Dur > maxDur) maxDur = s.Dur;
     sb.Append("#EXT-X-TARGETDURATION:").Append((int)Math.Ceiling(maxDur)).Append('\n');
+    // HOLD-BACK tells the player how far behind the live edge to sit. The Chromecast
+    // receiver otherwise rides the bleeding edge and starves the moment the recorder
+    // hiccups; a bigger hold-back buys runway. Only on live (no ENDLIST) playlists, and
+    // only when asked (the browser keeps its own tighter latency).
+    if (!endlist && holdBackSec > 0)
+        sb.Append("#EXT-X-SERVER-CONTROL:HOLD-BACK=").Append(holdBackSec.ToString("0.0", CultureInfo.InvariantCulture)).Append('\n');
     sb.Append("#EXT-X-MEDIA-SEQUENCE:").Append(segs.Length > 0 ? segs[0].Id : 0).Append('\n');
     if (endlist) sb.Append("#EXT-X-PLAYLIST-TYPE:VOD\n");
     bool needPdt = true; // emit PROGRAM-DATE-TIME on the first segment and after each
@@ -502,7 +508,7 @@ app.MapPost("/set", async (HttpRequest request) =>
 // ever sees the single recorder ingest, regardless of how many people are watching.
 // Viewers sit a little behind true-live (recorder lag + player buffer). Cold start or
 // DVR disabled falls back to the verbatim upstream passthrough below.
-app.MapGet("/stream.m3u8", async (HttpResponse response, HttpClient http, CancellationToken ct) =>
+app.MapGet("/stream.m3u8", async (HttpResponse response, HttpRequest request, HttpClient http, CancellationToken ct) =>
 {
     var (playlistUrl, _) = state.Snapshot();
     if (playlistUrl is null)
@@ -514,12 +520,19 @@ app.MapGet("/stream.m3u8", async (HttpResponse response, HttpClient http, Cancel
 
     if (dvrEnabled)
     {
-        var live = dvr.LiveWindow(liveSegments);
+        // ?n=N requests a bigger window (the Chromecast wants more buffer than a browser);
+        // ?hb=S sets the live HOLD-BACK seconds. Defaults are the lean viewer window.
+        int n = liveSegments;
+        if (int.TryParse(request.Query["n"], out var qn) && qn > 0) n = Math.Clamp(qn, 3, 60);
+        double hb = 0;
+        if (double.TryParse(request.Query["hb"], NumberStyles.Float, CultureInfo.InvariantCulture, out var qhb) && qhb > 0)
+            hb = Math.Min(qhb, n * Math.Ceiling(6.0));   // never ask to sit further back than the window holds
+        var live = dvr.LiveWindow(n);
         if (live.Length > 0)
         {
             response.ContentType = "application/vnd.apple.mpegurl";
             response.Headers.CacheControl = "no-cache, no-store";
-            await response.WriteAsync(BuildDvrPlaylist(live, endlist: false), ct);
+            await response.WriteAsync(BuildDvrPlaylist(live, endlist: false, holdBackSec: hb), ct);
             return;
         }
         // Buffer empty (cold start / just switched) — fall through to passthrough
@@ -897,6 +910,7 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
     var remotePlayer = null, remoteController = null;
     var castMode = null;       // 'live' | 'dvr'
     var castVodFromMs = 0;     // fromUtc of the VOD snapshot currently on the cast (for seeking)
+    var lastCastAt = 0;        // when we last (re)loaded media — cooldown for auto-recovery
 
     window.initCast = function () {
       if (castContext) return;
@@ -908,8 +922,15 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
       });
       console.log('[cast] context configured, appId=', chrome.cast.media.DEFAULT_MEDIA_RECEIVER_APP_ID,
         'secureContext=', window.isSecureContext, 'origin=', window.location.origin);
-      // Lets the browser drive the cast session (seek it to follow our scrubbing).
-      try { remotePlayer = new cast.framework.RemotePlayer(); remoteController = new cast.framework.RemotePlayerController(remotePlayer); } catch (e) {}
+      // Lets the browser drive the cast session (seek it to follow our scrubbing) and
+      // notices when the receiver goes idle (stream ended / starved) so we can re-cast.
+      try {
+        remotePlayer = new cast.framework.RemotePlayer();
+        remoteController = new cast.framework.RemotePlayerController(remotePlayer);
+        remoteController.addEventListener(cast.framework.RemotePlayerEventType.PLAYER_STATE_CHANGED, function () {
+          if (remotePlayer.playerState === chrome.cast.media.PlayerState.IDLE) onCastIdle();
+        });
+      } catch (e) {}
       castContext.addEventListener(
         cast.framework.CastContextEventType.SESSION_STATE_CHANGED,
         function (e) {
@@ -968,13 +989,25 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
     function castLoad() {
       var session = isCasting();
       if (!session) { setStatus('Cast: no active session'); return; }
-      var castBase = castBaseUrl();
       var pd = (hls && hls.playingDate) ? hls.playingDate.getTime() : null;
       if (!atLiveEdge() && pd !== null) {
         castDvrAt(pd);   // scrubbed back -> cast a SMALL bounded history window at this instant
       } else {
-        castMedia(session, castBase, castBase + '/stream.m3u8?t=' + Date.now(), chrome.cast.media.StreamType.LIVE, 0, 'live');
+        castLoadLive();
       }
+    }
+
+    // Cast LIVE with a GENEROUS window (n) + HOLD-BACK so the Chromecast receiver sits well
+    // behind the edge and has runway — it starves and drops the cast otherwise (the browser
+    // has a stall-watchdog + huge back-buffer; the receiver has neither).
+    var CAST_LIVE_SEGS = 20, CAST_HOLDBACK_SEC = 30;
+    function castLoadLive() {
+      var session = isCasting();
+      if (!session) return;
+      var castBase = castBaseUrl();
+      castMedia(session, castBase,
+        castBase + '/stream.m3u8?n=' + CAST_LIVE_SEGS + '&hb=' + CAST_HOLDBACK_SEC + '&t=' + Date.now(),
+        chrome.cast.media.StreamType.LIVE, 0, 'live');
     }
 
     // How many seconds of lead-in the bounded history cast includes before the watched
@@ -982,6 +1015,7 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
     var CAST_LEAD_SEC = 60;
 
     function castMedia(session, castBase, url, streamType, startTime, mode) {
+      lastCastAt = Date.now();
       console.log('[cast] loading', url, 'startTime', startTime, 'mode', mode);
       setStatus('Casting… ' + (mode === 'live' ? 'live' : ('history @' + Math.round(startTime) + 's')));
       var info = new chrome.cast.media.MediaInfo(url, 'application/x-mpegurl');
@@ -1038,6 +1072,40 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
       castVodFromMs = fromMs;
       castMedia(session, castBaseUrl(), castBaseUrl() + '/dvr.m3u8?vod=1&from=' + fromMs + '&t=' + Date.now(),
         chrome.cast.media.StreamType.BUFFERED, CAST_LEAD_SEC, 'dvr');   // start CAST_LEAD_SEC in = at dateMs
+    }
+
+    // --- Cast self-heal ------------------------------------------------------
+    // The Chromecast receiver has no stall recovery of its own: a live cast that starves
+    // at the edge gets stuck "loading", and a history (VOD) cast that reaches its end goes
+    // IDLE/FINISHED — both leave the blue idle screen. We watch for that and re-cast,
+    // continuing from where the cast was (or live), which is what the browser does for itself.
+    function castMediaSession() { try { var s = isCasting(); return s ? s.getMediaSession() : null; } catch (e) { return null; } }
+
+    function onCastIdle() {
+      var m = castMediaSession();
+      var reason = m ? m.idleReason : null;
+      // Only an UNEXPECTED stop (ended / errored) — not our own stop/replace (CANCELLED/INTERRUPTED).
+      if (reason === chrome.cast.media.IdleReason.FINISHED || reason === chrome.cast.media.IdleReason.ERROR)
+        recoverCast('idle:' + reason);
+    }
+
+    function recoverCast(why) {
+      if (!isCasting()) return;
+      if (Date.now() - lastCastAt < 8000) return;   // cooldown — never loop tightly
+      console.log('[cast] recovering (' + why + ')');
+      setStatus('Cast stalled — recovering…');
+      // If we were showing history, continue from where the cast actually was; if that has
+      // caught up to (near) the live edge, switch to the live stream. Otherwise just go live.
+      if (castMode === 'dvr' && castVodFromMs && remotePlayer) {
+        var castWall = castVodFromMs + (remotePlayer.currentTime || 0) * 1000;
+        fetch('/dvr/status').then(function (r) { return r.json(); }).then(function (s) {
+          var live = s.toUtc ? Date.parse(s.toUtc) : 0;
+          if (live && castWall >= live - 30000) castLoadLive();
+          else castDvrAt(castWall);
+        }).catch(function () { castLoadLive(); });
+      } else {
+        castLoadLive();
+      }
     }
 
     function castFail(msg) {
@@ -1266,6 +1334,23 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
     // When the user scrubs the player, mirror the new position to the cast (if casting)
     // and remember the spot so a refresh resumes here.
     v.addEventListener('seeked', function () { scheduleCastSync(); saveResume(); });
+
+    // Cast stall-watchdog: catches the "stuck loading, never goes IDLE" case (the receiver
+    // buffering forever at a starved live edge). If the cast playhead stops advancing while
+    // it should be playing, re-cast. Mirrors the browser's own watchdog.
+    var castWdLast = -1, castWdSince = 0;
+    setInterval(function () {
+      if (!isCasting() || !remotePlayer || !remotePlayer.isMediaLoaded || remotePlayer.isPaused) {
+        castWdSince = 0; castWdLast = -1; return;
+      }
+      var t = remotePlayer.currentTime || 0;
+      if (t > castWdLast + 0.25) { castWdLast = t; castWdSince = 0; return; }
+      if (castWdSince === 0) { castWdSince = Date.now(); return; }
+      if (Date.now() - castWdSince > 18000 && Date.now() - lastCastAt > 14000) {
+        castWdSince = 0; castWdLast = -1;
+        recoverCast('watchdog: cast not advancing');
+      }
+    }, 5000);
 
     // Persist the watch position continuously and on the events that precede a sleep/close,
     // so a refresh / cast-reconnect can resume exactly where we were.
