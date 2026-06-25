@@ -577,6 +577,19 @@ app.MapGet("/dvr.m3u8", (HttpResponse response, HttpRequest request) =>
         var cutoff = DateTime.UtcNow - TimeSpan.FromHours(h);
         segs = Array.FindAll(segs, s => s.Utc >= cutoff);
     }
+    // ?from=&to= (unix ms) bound the window to an arbitrary range — used to cast a SMALL
+    // playlist around a scrubbed-back position instead of the whole 24h (which the
+    // Chromecast receiver chokes on).
+    if (long.TryParse(request.Query["from"], out var fromMs))
+    {
+        var fromUtc = DateTimeOffset.FromUnixTimeMilliseconds(fromMs).UtcDateTime;
+        segs = Array.FindAll(segs, s => s.Utc >= fromUtc);
+    }
+    if (long.TryParse(request.Query["to"], out var toMs))
+    {
+        var toUtc = DateTimeOffset.FromUnixTimeMilliseconds(toMs).UtcDateTime;
+        segs = Array.FindAll(segs, s => s.Utc <= toUtc);
+    }
     bool vod = request.Query["vod"] == "1";
 
     response.ContentType = "application/vnd.apple.mpegurl";
@@ -886,12 +899,15 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
     var castVodFromMs = 0;     // fromUtc of the VOD snapshot currently on the cast (for seeking)
 
     window.initCast = function () {
-      if (castContext || !window.__castApiAvailable) return;
+      if (castContext) return;
+      if (!window.__castApiAvailable) { console.log('[cast] init skipped: SDK not ready'); return; }
       castContext = cast.framework.CastContext.getInstance();
       castContext.setOptions({
         receiverApplicationId: chrome.cast.media.DEFAULT_MEDIA_RECEIVER_APP_ID,
         autoJoinPolicy: chrome.cast.AutoJoinPolicy.ORIGIN_SCOPED
       });
+      console.log('[cast] context configured, appId=', chrome.cast.media.DEFAULT_MEDIA_RECEIVER_APP_ID,
+        'secureContext=', window.isSecureContext, 'origin=', window.location.origin);
       // Lets the browser drive the cast session (seek it to follow our scrubbing).
       try { remotePlayer = new cast.framework.RemotePlayer(); remoteController = new cast.framework.RemotePlayerController(remotePlayer); } catch (e) {}
       castContext.addEventListener(
@@ -911,8 +927,17 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
               castLoad();
             }
           } else if (e.sessionState === cast.framework.SessionState.SESSION_START_FAILED) {
-            setStatus('Cast: session failed to start');
-            castFail('Cast session failed to start — check the Chromecast is on the same network.');
+            // The cast DEVICE handshake failed — before any media. Surface the real error
+            // code (RECEIVER_UNAVAILABLE / TIMEOUT / CHANNEL_ERROR / SESSION_ERROR / ...)
+            // instead of guessing "same network".
+            var code = (e && (e.errorCode || (e.error && e.error.code))) || 'unknown';
+            console.log('[cast] SESSION_START_FAILED errorCode=', code, e);
+            setStatus('Cast: session failed to start (' + code + ')');
+            castFail('Cast session failed to start (error: ' + code + '). This is the Chromecast ' +
+              'handshake failing, before any video. Common causes: the Chromecast is on a different ' +
+              'Wi‑Fi/VLAN than this device (guest networks isolate it), the Chromecast has no internet ' +
+              'to load its receiver app, or it is busy with another app. Try: cast YouTube to it to ' +
+              'confirm the device works, reboot the Chromecast, and ensure both are on the same network.');
           }
         }
       );
@@ -946,16 +971,15 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
       var castBase = castBaseUrl();
       var pd = (hls && hls.playingDate) ? hls.playingDate.getTime() : null;
       if (!atLiveEdge() && pd !== null) {
-        fetch('/dvr/status').then(function (r) { return r.json(); }).then(function (s) {
-          var from = s.fromUtc ? Date.parse(s.fromUtc) : null;
-          var offset = (from !== null) ? Math.max(0, (pd - from) / 1000) : 0;
-          castVodFromMs = (from !== null) ? from : 0;
-          castMedia(session, castBase, castBase + '/dvr.m3u8?vod=1&t=' + Date.now(), chrome.cast.media.StreamType.BUFFERED, offset, 'dvr');
-        }).catch(function () { castMedia(session, castBase, castBase + '/stream.m3u8?t=' + Date.now(), chrome.cast.media.StreamType.LIVE, 0, 'live'); });
+        castDvrAt(pd);   // scrubbed back -> cast a SMALL bounded history window at this instant
       } else {
         castMedia(session, castBase, castBase + '/stream.m3u8?t=' + Date.now(), chrome.cast.media.StreamType.LIVE, 0, 'live');
       }
     }
+
+    // How many seconds of lead-in the bounded history cast includes before the watched
+    // instant. The cast playlist is then (instant-LEAD .. live) — small + reliable, NOT 24h.
+    var CAST_LEAD_SEC = 60;
 
     function castMedia(session, castBase, url, streamType, startTime, mode) {
       console.log('[cast] loading', url, 'startTime', startTime, 'mode', mode);
@@ -1004,18 +1028,16 @@ static string IndexPage(string? current, int httpPort, string castHost) => $$"""
       castLoad(); // not on DVR yet, or scrubbed beyond the snapshot -> (re)load fresh
     }
 
-    // Cast the DVR VOD positioned at a specific wall-clock instant (independent of the
-    // browser's own playhead). Used on cast reconnect to snap the TV to the saved spot.
+    // Cast a SMALL bounded DVR window (≈CAST_LEAD_SEC before `dateMs` .. live) as a VOD,
+    // positioned at `dateMs`. Bounding it is essential — casting the full 24h playlist
+    // overwhelms the Chromecast receiver. Used on reconnect and for scrubbed casts.
     function castDvrAt(dateMs) {
       var session = isCasting();
       if (!session) return;
-      var castBase = castBaseUrl();
-      fetch('/dvr/status').then(function (r) { return r.json(); }).then(function (s) {
-        var from = s.fromUtc ? Date.parse(s.fromUtc) : null;
-        var offset = (from !== null) ? Math.max(0, (dateMs - from) / 1000) : 0;
-        castVodFromMs = (from !== null) ? from : 0;
-        castMedia(session, castBase, castBase + '/dvr.m3u8?vod=1&t=' + Date.now(), chrome.cast.media.StreamType.BUFFERED, offset, 'dvr');
-      }).catch(function () { castLoad(); });
+      var fromMs = dateMs - CAST_LEAD_SEC * 1000;
+      castVodFromMs = fromMs;
+      castMedia(session, castBaseUrl(), castBaseUrl() + '/dvr.m3u8?vod=1&from=' + fromMs + '&t=' + Date.now(),
+        chrome.cast.media.StreamType.BUFFERED, CAST_LEAD_SEC, 'dvr');   // start CAST_LEAD_SEC in = at dateMs
     }
 
     function castFail(msg) {
